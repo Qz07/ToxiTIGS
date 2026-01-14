@@ -28,6 +28,7 @@ Run:
 """
 
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import json
 import math
 import time
@@ -36,14 +37,12 @@ import random
 import argparse
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
 from tqdm import tqdm
-from tqdm.auto import tqdm
 
 # HF / PEFT
 from transformers import (
@@ -139,7 +138,7 @@ class GPT2BlockDataset(Dataset):
             data_dict = pickle.load(f)
 
         texts = []
-        for _, v in tqdm(data_dict.items(), desc="Get Data:"):
+        for _, v in tqdm(data_dict.items(), desc="Get Data"):
             if isinstance(v, dict):
                 t = v.get("generation", None)
                 if isinstance(t, str) and t.strip():
@@ -566,7 +565,7 @@ def parse_args():
     p.add_argument("--grad_clip", type=float, default=1.0)
 
     p.add_argument("--precision", type=str, default="bf16", choices=["bf16", "fp16"])
-    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
 
     # LoRA
