@@ -75,7 +75,7 @@ try:
 except Exception:
     wandb = None
 
-
+IGNORE_INDEX = -100
 # -----------------------------
 # utils
 # -----------------------------
@@ -117,76 +117,139 @@ def init_distributed():
 # dataset
 # -----------------------------
 
-class GPT2BlockDataset(Dataset):
-    def __init__(
-        self,
-        data_path: str,
-        tokenizer,
-        seq_len: int = 512,
-        max_samples: Optional[int] = None,
-        shuffle_texts: bool = True,
-        add_eos: bool = True,
-        tok_batch_size: int = 256,     # ✅ controls speed/memory of tokenization
-        show_tokenize_pbar: bool = True,
-    ):
-        super().__init__()
-        self.seq_len = seq_len
-        self.tokenizer = tokenizer
-        self.add_eos = add_eos
+# class GPT2BlockDataset(Dataset):
+#     def __init__(
+#         self,
+#         data_path: str,
+#         tokenizer,
+#         seq_len: int = 512,
+#         max_samples: Optional[int] = None,
+#         shuffle_texts: bool = True,
+#         add_eos: bool = True,
+#         tok_batch_size: int = 256,     # ✅ controls speed/memory of tokenization
+#         show_tokenize_pbar: bool = True,
+#     ):
+#         super().__init__()
+#         self.seq_len = seq_len
+#         self.tokenizer = tokenizer
+#         self.add_eos = add_eos
         
-        with open(data_path, "rb") as f:
-            data_dict = pickle.load(f)
+#         with open(data_path, "rb") as f:
+#             data_dict = pickle.load(f)
 
-        texts = []
-        for _, v in tqdm(data_dict.items(), desc="Get Data"):
-            if isinstance(v, dict):
-                t = v.get("generation", None)
-                if isinstance(t, str) and t.strip():
-                    texts.append(t)
+#         texts = []
+#         for _, v in tqdm(data_dict.items(), desc="Get Data"):
+#             if isinstance(v, dict):
+#                 t = v.get("generation", None)
+#                 if isinstance(t, str) and t.strip():
+#                     texts.append(t)
 
-        if shuffle_texts:
-            random.shuffle(texts)
-        if max_samples is not None:
-            texts = texts[:max_samples]
+#         if shuffle_texts:
+#             random.shuffle(texts)
+#         if max_samples is not None:
+#             texts = texts[:max_samples]
 
-        eos = tokenizer.eos_token_id
+#         eos = tokenizer.eos_token_id
 
-        all_ids: List[int] = []
-        it = range(0, len(texts), tok_batch_size)
-        print('start tokenizing')
+#         all_ids: List[int] = []
+#         it = range(0, len(texts), tok_batch_size)
+#         print('start tokenizing')
 
-        pbar = tqdm(
-            it,
-            desc="Tokenizing",
-            dynamic_ncols=True,
-            disable=(not show_tokenize_pbar) or (not is_rank0()),
-        )
+#         pbar = tqdm(
+#             it,
+#             desc="Tokenizing",
+#             dynamic_ncols=True,
+#             disable=(not show_tokenize_pbar) or (not is_rank0()),
+#         )
 
-        for i in pbar:
-            batch_texts = texts[i : i + tok_batch_size]
-            enc = tokenizer(batch_texts, add_special_tokens=False)
-            # enc["input_ids"] is a list[list[int]]
-            for ids in enc["input_ids"]:
-                if add_eos and eos is not None:
-                    ids = ids + [eos]
-                all_ids.extend(ids)
+#         for i in pbar:
+#             batch_texts = texts[i : i + tok_batch_size]
+#             enc = tokenizer(batch_texts, add_special_tokens=False)
+#             # enc["input_ids"] is a list[list[int]]
+#             for ids in enc["input_ids"]:
+#                 if add_eos and eos is not None:
+#                     ids = ids + [eos]
+#                 all_ids.extend(ids)
 
-        # chunk into fixed blocks
-        n_blocks = len(all_ids) // seq_len
-        self.blocks = [
-            torch.tensor(all_ids[i * seq_len : (i + 1) * seq_len], dtype=torch.long)
-            for i in range(n_blocks)
-        ]
+#         # chunk into fixed blocks
+#         n_blocks = len(all_ids) // seq_len
+#         self.blocks = [
+#             torch.tensor(all_ids[i * seq_len : (i + 1) * seq_len], dtype=torch.long)
+#             for i in range(n_blocks)
+#         ]
 
-        if is_rank0():
-            print(f"[dataset] texts={len(texts)} total_tokens={len(all_ids)} blocks={len(self.blocks)} seq_len={seq_len}")
+#         if is_rank0():
+#             print(f"[dataset] texts={len(texts)} total_tokens={len(all_ids)} blocks={len(self.blocks)} seq_len={seq_len}")
+
+#     def __len__(self):
+#         return len(self.blocks)
+
+#     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+#         x = self.blocks[idx]
+#         return {"input_ids": x, "labels": x.clone()}
+
+def pad_collate(batch, pad_id, label_pad_id=IGNORE_INDEX):
+    max_len = max(x["input_ids"].size(0) for x in batch)
+
+    def pad_1d(t, pad_value):
+        return torch.nn.functional.pad(t, (0, max_len - t.size(0)), value=pad_value)
+
+    input_ids = torch.stack([pad_1d(x["input_ids"], pad_id) for x in batch])
+    attention_mask = torch.stack([pad_1d(x["attention_mask"], 0) for x in batch])
+    labels = torch.stack([pad_1d(x["labels"], label_pad_id) for x in batch])
+
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+
+
+
+class PromptGenCausalDataset(Dataset):
+    """
+    Each item supervises ONLY the generation tokens.
+    """
+    def __init__(self, data_list, tokenizer, max_length=1024, separator="\n"):
+        self.data = data_list
+        self.tok = tokenizer
+        self.max_length = max_length
+        self.sep = separator
+
+        # for GPT2-like tokenizers
+        if self.tok.pad_token_id is None:
+            self.tok.pad_token = self.tok.eos_token
 
     def __len__(self):
-        return len(self.blocks)
+        return len(self.data)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        x = self.blocks[idx]
-        return {"input_ids": x, "labels": x.clone()}
+    def __getitem__(self, idx):
+        ex = self.data[idx]
+        prompt = ex["prompt"]
+        gen = ex["generation"]
+
+        # Tokenize separately so we can mask prompt labels cleanly
+        prompt_ids = self.tok(prompt + self.sep, add_special_tokens=False)["input_ids"]
+        gen_ids = self.tok(gen, add_special_tokens=False)["input_ids"]
+
+        # Optionally ensure an EOS at the end of the generation
+        if self.tok.eos_token_id is not None:
+            gen_ids = gen_ids + [self.tok.eos_token_id]
+
+        input_ids = prompt_ids + gen_ids
+        labels = [IGNORE_INDEX] * len(prompt_ids) + gen_ids[:]  # supervise only generation
+
+        # Truncate to max_length.
+        # IMPORTANT: usually you want to KEEP the generation, so truncate from the LEFT.
+        if len(input_ids) > self.max_length:
+            overflow = len(input_ids) - self.max_length
+            input_ids = input_ids[overflow:]
+            labels = labels[overflow:]
+
+        attention_mask = [1] * len(input_ids)
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
 
 
 @dataclass
@@ -357,25 +420,49 @@ def train(args):
     if is_dist():
         model = wrap_fsdp(model, args)
 
-    dataset = GPT2BlockDataset(
-        data_path=args.data_path,
-        tokenizer=tokenizer,
-        seq_len=args.seq_len,
-        max_samples=args.max_samples,
-        shuffle_texts=True,
-        add_eos=True,
-    )
+    # dataset = GPT2BlockDataset(
+    #     data_path=args.data_path,
+    #     tokenizer=tokenizer,
+    #     seq_len=args.seq_len,
+    #     max_samples=args.max_samples,
+    #     shuffle_texts=True,
+    #     add_eos=True,
+    # )
 
-    sampler = DistributedSampler(dataset, shuffle=True) if is_dist() else None
-    loader = DataLoader(
-        dataset,
+    # sampler = DistributedSampler(dataset, shuffle=True) if is_dist() else None
+    # loader = DataLoader(
+    #     dataset,
+    #     batch_size=args.batch_size,
+    #     sampler=sampler,
+    #     shuffle=(sampler is None),
+    #     num_workers=args.num_workers,
+    #     pin_memory=True,
+    #     drop_last=True,
+    #     collate_fn=Collate(),
+    # )
+
+    with open(args.data_path, "rb") as f:
+        data_list = pickle.load(f)  # list of {"prompt":..., "generation":...}
+
+    train_ds = PromptGenCausalDataset(data_list, tokenizer, max_length=args.seq_len, separator="\n")
+    collate_fn = lambda batch: pad_collate(batch, pad_id=tokenizer.pad_token_id)
+    
+    sampler = None
+    if dist.is_available() and dist.is_initialized():
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            train_ds,
+            shuffle=True,
+            drop_last=False,
+        )
+
+    
+    loader = torch.utils.data.DataLoader(
+        train_ds,
         batch_size=args.batch_size,
-        sampler=sampler,
-        shuffle=(sampler is None),
+        shuffle=True,
         num_workers=args.num_workers,
+        collate_fn=collate_fn,
         pin_memory=True,
-        drop_last=True,
-        collate_fn=Collate(),
     )
 
     # Only optimize trainable params (LoRA adapters if enabled)
