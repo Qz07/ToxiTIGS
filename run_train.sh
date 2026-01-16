@@ -1,6 +1,6 @@
 torchrun --nproc_per_node=2 gpt2-train.py \
   --data_path ./data/jan13_toxic_data_250k.pickle \
-  --output_dir ./ckpts/ckpts_full_train_250k \
+  --output_dir ./ckpts/train_all_250k \
   --model_name gpt2 \
   --seq_len 256 \
   --epochs 1 \
@@ -8,5 +8,5 @@ torchrun --nproc_per_node=2 gpt2-train.py \
   --grad_accum 8 \
   --lr 2e-4 \
   --use_lora --freeze_base \
-  --use_wandb --wandb_project gpt2-next-token --run_name full_250k_train \
-  --save_every 10000 --save_at_epoch_end
+  --use_wandb --wandb_project gpt2-next-token --run_name train_all_250k \
+  --save_every 500 --save_at_epoch_end

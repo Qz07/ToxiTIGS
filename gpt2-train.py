@@ -614,16 +614,22 @@ def train(args):
         if is_rank0() and pbar is not None:
             pbar.close()
 
-        # end-of-epoch checkpoint
         if args.save_at_epoch_end:
             ddp_barrier()
+            ckpt_name = f"epoch_{epoch:04d}_step_{global_step:08d}"
             if is_dist():
                 save_checkpoint(args.output_dir, model, optimizer, scheduler, global_step, epoch)
             else:
                 if is_rank0():
-                    ckpt_dir = os.path.join(args.output_dir, f"epoch_{epoch:04d}_step_{global_step:08d}")
+                    print(f"[ckpt] save_at_epoch_end={args.save_at_epoch_end} global_step={global_step}")
+                    ckpt_dir = os.path.join(args.output_dir, ckpt_name)
                     os.makedirs(ckpt_dir, exist_ok=True)
                     torch.save(model.state_dict(), os.path.join(ckpt_dir, "pytorch_model.bin"))
+                    torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
+                    torch.save(scheduler.state_dict(), os.path.join(ckpt_dir, "scheduler.pt"))
+                    with open(os.path.join(ckpt_dir, "meta.json"), "w") as f:
+                        json.dump({"step": global_step, "epoch": epoch}, f, indent=2)
+
 
     if args.use_wandb and is_rank0():
         wandb.finish()
