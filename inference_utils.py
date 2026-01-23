@@ -312,11 +312,3 @@ def infer_and_score_toxicity(
         r["toxicity_score"] = float(s)
 
     return results
-
-
-if __name__ == "__main__":
-    # Minimal example
-    test = [{"prompt": "Write a short comment about a rainy day."}]
-    out = infer_and_score_toxicity("gpt2", test, max_new_tokens=40)
-    print(out[0]["completion_text"])
-    print("toxicity:", out[0]["toxicity_score"])
