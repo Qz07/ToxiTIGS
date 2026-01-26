@@ -112,82 +112,6 @@ def init_distributed():
         # single-process fallback
         pass
 
-
-# -----------------------------
-# dataset
-# -----------------------------
-
-# class GPT2BlockDataset(Dataset):
-#     def __init__(
-#         self,
-#         data_path: str,
-#         tokenizer,
-#         seq_len: int = 512,
-#         max_samples: Optional[int] = None,
-#         shuffle_texts: bool = True,
-#         add_eos: bool = True,
-#         tok_batch_size: int = 256,     # ✅ controls speed/memory of tokenization
-#         show_tokenize_pbar: bool = True,
-#     ):
-#         super().__init__()
-#         self.seq_len = seq_len
-#         self.tokenizer = tokenizer
-#         self.add_eos = add_eos
-        
-#         with open(data_path, "rb") as f:
-#             data_dict = pickle.load(f)
-
-#         texts = []
-#         for _, v in tqdm(data_dict.items(), desc="Get Data"):
-#             if isinstance(v, dict):
-#                 t = v.get("generation", None)
-#                 if isinstance(t, str) and t.strip():
-#                     texts.append(t)
-
-#         if shuffle_texts:
-#             random.shuffle(texts)
-#         if max_samples is not None:
-#             texts = texts[:max_samples]
-
-#         eos = tokenizer.eos_token_id
-
-#         all_ids: List[int] = []
-#         it = range(0, len(texts), tok_batch_size)
-#         print('start tokenizing')
-
-#         pbar = tqdm(
-#             it,
-#             desc="Tokenizing",
-#             dynamic_ncols=True,
-#             disable=(not show_tokenize_pbar) or (not is_rank0()),
-#         )
-
-#         for i in pbar:
-#             batch_texts = texts[i : i + tok_batch_size]
-#             enc = tokenizer(batch_texts, add_special_tokens=False)
-#             # enc["input_ids"] is a list[list[int]]
-#             for ids in enc["input_ids"]:
-#                 if add_eos and eos is not None:
-#                     ids = ids + [eos]
-#                 all_ids.extend(ids)
-
-#         # chunk into fixed blocks
-#         n_blocks = len(all_ids) // seq_len
-#         self.blocks = [
-#             torch.tensor(all_ids[i * seq_len : (i + 1) * seq_len], dtype=torch.long)
-#             for i in range(n_blocks)
-#         ]
-
-#         if is_rank0():
-#             print(f"[dataset] texts={len(texts)} total_tokens={len(all_ids)} blocks={len(self.blocks)} seq_len={seq_len}")
-
-#     def __len__(self):
-#         return len(self.blocks)
-
-#     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-#         x = self.blocks[idx]
-#         return {"input_ids": x, "labels": x.clone()}
-
 def pad_collate(batch, pad_id, label_pad_id=IGNORE_INDEX):
     max_len = max(x["input_ids"].size(0) for x in batch)
 
@@ -350,17 +274,14 @@ def wrap_fsdp(model, args):
 # -----------------------------
 @torch.no_grad()
 def token_accuracy_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """
-    logits: [B, T, V]
-    labels: [B, T]
-    GPT-2 loss uses shift: predict token t+1 from position t.
-    So compare logits[:, :-1] with labels[:, 1:].
-    """
-    preds = torch.argmax(logits[:, :-1, :], dim=-1)      # [B, T-1]
-    gold = labels[:, 1:]                                 # [B, T-1]
-    correct = (preds == gold).float().sum()
-    total = torch.numel(gold)
-    return correct / max(total, 1)
+    preds = torch.argmax(logits[:, :-1, :], dim=-1)   # [B, T-1]
+    gold  = labels[:, 1:]                             # [B, T-1]
+    mask  = (gold != IGNORE_INDEX)
+    if mask.sum() == 0:
+        return torch.tensor(0.0, device=logits.device)
+    correct = (preds[mask] == gold[mask]).float().mean()
+    return correct
+
 
 
 def grad_norm(parameters, norm_type=2.0):
@@ -414,32 +335,14 @@ def train(args):
             )
 
     tokenizer, model = build_model_and_tokenizer(args)
+    
+    model.config.pad_token_id = tokenizer.pad_token_id
+    
     model = maybe_apply_activation_ckpt(model, args)
     model.cuda()
 
     if is_dist():
         model = wrap_fsdp(model, args)
-
-    # dataset = GPT2BlockDataset(
-    #     data_path=args.data_path,
-    #     tokenizer=tokenizer,
-    #     seq_len=args.seq_len,
-    #     max_samples=args.max_samples,
-    #     shuffle_texts=True,
-    #     add_eos=True,
-    # )
-
-    # sampler = DistributedSampler(dataset, shuffle=True) if is_dist() else None
-    # loader = DataLoader(
-    #     dataset,
-    #     batch_size=args.batch_size,
-    #     sampler=sampler,
-    #     shuffle=(sampler is None),
-    #     num_workers=args.num_workers,
-    #     pin_memory=True,
-    #     drop_last=True,
-    #     collate_fn=Collate(),
-    # )
 
     with open(args.data_path, "rb") as f:
         data_list = pickle.load(f)  # list of {"prompt":..., "generation":...}
@@ -447,19 +350,22 @@ def train(args):
     train_ds = PromptGenCausalDataset(data_list, tokenizer, max_length=args.seq_len, separator="\n")
     collate_fn = lambda batch: pad_collate(batch, pad_id=tokenizer.pad_token_id)
     
+    # --- build sampler (DDP) ---
     sampler = None
-    if dist.is_available() and dist.is_initialized():
-        sampler = torch.utils.data.distributed.DistributedSampler(
+    if is_dist():
+        sampler = DistributedSampler(
             train_ds,
+            num_replicas=world_size(),
+            rank=rank(),
             shuffle=True,
             drop_last=False,
         )
-
     
     loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=sampler,                 # IMPORTANT
+        shuffle=(sampler is None),        # IMPORTANT: don't shuffle if sampler is set
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
@@ -516,9 +422,12 @@ def train(args):
             input_ids = batch["input_ids"].cuda(non_blocking=True)
             labels = batch["labels"].cuda(non_blocking=True)
 
+            attention_mask = batch["attention_mask"].cuda(non_blocking=True)
+            
             with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-                out = model(input_ids=input_ids, labels=labels)
+                out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 loss = out.loss / args.grad_accum
+
 
             loss.backward()
 

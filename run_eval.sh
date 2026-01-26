@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # 1. Configuration - Update these paths
-# MODEL_PATH="./ckpts/train_all_250k/step_00000980"
-MODEL_PATH="gpt2"               # or path/to/your/checkpoint
+MODEL_PATH="./ckpts/train_all_250k_jan22/step_00000490"
+# MODEL_PATH="gpt2"               # or path/to/your/checkpoint
 # or path/to/your/checkpoint
 DATA_PATH="./data/jan22_test_310.pickle"
 BASE_MODEL="gpt2"                  # only needed if MODEL_PATH is a .bin file
