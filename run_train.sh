@@ -1,12 +1,11 @@
 torchrun --nproc_per_node=2 gpt2-train.py \
-  --data_path ./data/jan13_toxic_data_250k.pickle \
-  --output_dir ./ckpts/train_all_250k_jan22 \
+  --data_path ./data/jan26_filter_lt_256_248k.pickle \
+  --output_dir ./ckpts/train_lt_256 \
   --model_name gpt2 \
   --seq_len 256 \
   --epochs 1 \
   --batch_size 32 \
   --grad_accum 8 \
   --lr 2e-4 \
-  --use_lora --freeze_base \
-  --use_wandb --wandb_project gpt2-next-token --run_name train_all_250k_jan22 \
+  --use_wandb --wandb_project gpt2-next-token --run_name train_lt_256 \
   --save_every 500 --save_at_epoch_end

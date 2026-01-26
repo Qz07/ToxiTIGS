@@ -12,19 +12,23 @@ We use "generation" text only.
 
 Features:
 - FSDP sharding across GPUs (torchrun)
-- LoRA via PEFT (default: freeze base, train adapters only)
 - Mixed precision (bf16 on A5000)
 - tqdm progress bar (rank0 only)
 - wandb logging (rank0 only)
 - checkpoint saving with full state dict gathered on rank0
 
-Run:
-  torchrun --nproc_per_node=2 train_gpt2_fsdp_lora.py \
-    --data_path /path/to/data.pkl \
-    --output_dir ./ckpts_gpt2 \
-    --wandb_project gpt2-next-token \
-    --run_name a5000-fsdp-lora \
-    --epochs 1 --batch_size 2 --grad_accum 8 --seq_len 512 --lr 2e-4
+Run: 
+torchrun --nproc_per_node=2 gpt2-train.py \
+  --data_path ./data/jan26_filter_lt_256_248k.pickle \
+  --output_dir ./ckpts/train_lt_256 \
+  --model_name gpt2 \
+  --seq_len 256 \
+  --epochs 1 \
+  --batch_size 32 \
+  --grad_accum 8 \
+  --lr 2e-4 \
+  --use_wandb --wandb_project gpt2-next-token --run_name train_lt_256 \
+  --save_every 500 --save_at_epoch_end
 """
 
 import os
@@ -198,25 +202,7 @@ def build_model_and_tokenizer(args):
 
     base = GPT2LMHeadModel.from_pretrained(args.model_name)
 
-    if args.use_lora:
-        # Typical GPT-2 attention module uses "c_attn" and "c_proj"
-        lora_cfg = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=["c_attn", "c_proj"],
-        )
-        model = get_peft_model(base, lora_cfg)
-
-        if args.freeze_base:
-            # PEFT already makes only LoRA trainable; this is just extra safety.
-            for n, p in model.named_parameters():
-                if "lora_" not in n:
-                    p.requires_grad = False
-    else:
-        model = base
+    model = base
 
     return tokenizer, model
 
@@ -570,12 +556,6 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
 
-    # LoRA
-    p.add_argument("--use_lora", action="store_true")
-    p.add_argument("--freeze_base", action="store_true")
-    p.add_argument("--lora_r", type=int, default=16)
-    p.add_argument("--lora_alpha", type=int, default=32)
-    p.add_argument("--lora_dropout", type=float, default=0.05)
 
     # Activation checkpointing
     p.add_argument("--activation_checkpointing", action="store_true")
@@ -583,7 +563,7 @@ def parse_args():
     # Logging
     p.add_argument("--use_wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default="gpt2-next-token")
-    p.add_argument("--run_name", type=str, default="fsdp-lora-run")
+    p.add_argument("--run_name", type=str, default="fsdp-run")
 
     # Saving
     p.add_argument("--save_every", type=int, default=200)  # in optimizer steps; 0 disables
