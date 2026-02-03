@@ -1,7 +1,7 @@
 # #!/bin/bash
 
 # # 1. Configuration - Update these paths
-# MODEL_PATH="./ckpts/train_lt_256/step_00000484"
+# MODEL_PATH="./ckpts/ga_train_lt_256/step_00000245"
 # # MODEL_PATH="gpt2"               # or path/to/your/checkpoint
 # # or path/to/your/checkpoint
 # DATA_PATH="./data/jan22_test_310.pickle"
@@ -38,4 +38,4 @@ python perplexity.py \
   --split test \
   --tox_threshold 0.5 \
   --max_toxic_samples 5000 \
-  --seq_len 1024 --stride 512
+  --seq_len 256 --stride 1
