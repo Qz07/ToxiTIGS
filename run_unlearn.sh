@@ -21,26 +21,19 @@ set -euo pipefail
 
 DATA_PATH="./data/jan26_filter_lt_256_248k.pickle"
 CKPT_DIR="./ckpts/train_lt_256/step_00000484"   # contains config.json + model.safetensors etc
-OUT_DIR="./rmu_out_gpt2"
+OUT_DIR="./ckpts/rmu_out_gpt2"
+WANDB_PROJ="ToxicGS-unlearning"
+RUN_NAME="rmu-gpt2-fsdp"
 
 export TOKENIZERS_PARALLELISM=false
 
-torchrun --nproc_per_node=2 unlearn_rmu_gpt2_fsdp.py \
+torchrun --nproc_per_node=5 unlearn_rmu.py \
   --data_path "$DATA_PATH" \
-  --model_name_or_path "$CKPT_DIR" \
+  --ckpt_dir  "$CKPT_DIR" \
   --output_dir "$OUT_DIR" \
-  --seq_len 512 \
-  --batch_size 2 \
-  --grad_accum 8 \
-  --epochs 3 \
-  --lr 5e-5 \
-  --warmup_ratio 0.03 \
-  --weight_decay 0.01 \
-  --bf16 \
-  --alpha 200.0 \
-  --beta 1.0 \
-  --c 4.0 \
-  --k_schedule "0.75,1.0,1.0" \
-  --save_each_epoch \
-  --wandb_project "rmu-unlearning" \
-  --run_name "gpt2-rmu-fsdp-a5000"
+  --seq_len 256 --batch_size 32 --grad_accum 8 \
+  --epochs 1 --lr 2e-5 \
+  --alpha 4.0 --c 1.0 --rmu_layer 8 \
+  --fp16 \
+  --wandb_project "$WANDB_PROJ" \
+  --wandb_run_name "$RUN_NAME"

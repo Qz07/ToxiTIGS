@@ -1,164 +1,85 @@
 #!/usr/bin/env python3
-# unlearn_rmu_gpt2_fsdp.py
 """
-RMU unlearning for GPT-2 (causal LM / NTP) with:
-- dataset: pickle file containing a list[dict] with keys: 'prompt', 'generation', 'label'
-    - label==1 => forget set
-    - label==0 => retain set
-- supervision ONLY on generation tokens (prompt tokens masked with -100)
-- RMU objective (activation rewriting) on a sampled layer each epoch:
-    L = L_forget_rmu + alpha * L_retain_match
-- Optional: add GA on forget set (gradient ascent on LM loss) via --ga_forget_weight > 0
-- FSDP across 2 GPUs (torchrun)
-- wandb logging (rank0 only)
-- resume from your step dir that contains:
-    meta.json, pytorch_model.bin, optimizer.pt, scheduler.pt
+RMU unlearning for GPT-2 with FSDP (2 GPUs).
 
-Run example:
-  torchrun --nproc_per_node=2 unlearn_rmu_gpt2_fsdp.py \
+- Data: list[dict] with keys: prompt, generation, label
+  * forget set: label==1
+  * retain set: label==0
+- Loss masking: supervised / RMU computed ONLY on generation tokens (prompt masked out)
+- RMU losses (activation-based) using hidden states at chosen layer:
+  L_forget  = MSE(h_updated, c*u) on forget gen tokens
+  L_retain  = MSE(h_updated - h_frozen, 0) on retain gen tokens
+  L_total   = L_forget + alpha * L_retain
+
+- Loading: base model first (gpt2), then apply finetuned weights from checkpoint/pytorch_model.bin
+- Optional resume: optimizer.pt, scheduler.pt
+
+Run:
+  torchrun --nproc_per_node=2 unlearn_rmu_fsdp.py \
     --data_path /path/to/data.pkl \
-    --model_name_or_path gpt2 \
-    --resume_dir /path/to/train_lt_256/step_00000484 \
-    --output_dir /path/to/rmu_out \
-    --seq_len 256 --batch_size 2 --grad_accum 8 --epochs 4 \
-    --lr 3e-4 --weight_decay 1e-4 \
-    --alpha 1000 --c 4.0 --k_schedule 0.75,1.0,1.0,1.0 \
-    --wandb_project toxic-unlearning --run_name rmu-gpt2-fsdp
+    --ckpt_dir  /path/to/train_lt_256/step_00000484 \
+    --output_dir ./rmu_out \
+    --wandb_project ToxiTIGS_RMU \
+    --seq_len 256 --batch_size 2 --grad_accum 8 \
+    --epochs 1 --lr 2e-5 --alpha 4.0 --c 1.0 --rmu_layer 8
 """
-
-from __future__ import annotations
 
 import argparse
-import copy
 import json
 import math
 import os
+import pickle
 import random
-import time
 from dataclasses import dataclass
-from itertools import cycle
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.distributed as dist
-from torch.utils.data import Dataset, DataLoader, Subset
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    get_linear_schedule_with_warmup,
-)
+from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup
 
 # FSDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType, FullStateDictConfig
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.distributed.fsdp.fully_sharded_data_parallel import MixedPrecision
+from torch.distributed.fsdp import ShardingStrategy
+
+try:
+    import wandb
+except Exception:
+    wandb = None
 
 
 # -------------------------
 # Utils
 # -------------------------
+
 def is_rank0() -> bool:
     return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
 
 
-def ddp_setup(local_rank: int):
-    if dist.is_initialized():
-        return
-    dist.init_process_group(backend="nccl")
-    torch.cuda.set_device(local_rank)
+def setup_distributed():
+    if dist.is_available() and not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
 
 
-def ddp_cleanup():
+def cleanup_distributed():
     if dist.is_available() and dist.is_initialized():
+        dist.barrier()
         dist.destroy_process_group()
 
 
-def set_all_seeds(seed: int):
+def seed_all(seed: int):
     random.seed(seed)
-    np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def safe_makedirs(path: str):
-    os.makedirs(path, exist_ok=True)
-
-
-def load_json_if_exists(path: str) -> Optional[dict]:
-    if path and os.path.exists(path):
-        with open(path, "r") as f:
-            return json.load(f)
-    return None
-
-
-def torch_load_if_exists(path: str, map_location="cpu"):
-    if path and os.path.exists(path):
-        return torch.load(path, map_location=map_location)
-    return None
-
-
-def parse_k_schedule(k_schedule_str: str, epochs: int) -> List[float]:
-    if not k_schedule_str:
-        ks = [0.75] + [1.0] * max(epochs - 1, 0)
-        return ks[:epochs]
-    parts = [float(x.strip()) for x in k_schedule_str.split(",") if x.strip()]
-    if not parts:
-        parts = [1.0]
-    if len(parts) < epochs:
-        parts = parts + [parts[-1]] * (epochs - len(parts))
-    return parts[:epochs]
-
-
-def get_layer_range_indices(k: float, num_layers: int) -> Tuple[int, int]:
-    if k == 0.25:
-        start_idx = 0
-        end_idx = int(num_layers * 0.25) - 1
-    elif k == 0.50:
-        start_idx = int(num_layers * 0.25)
-        end_idx = int(num_layers * 0.50) - 1
-    elif k == 0.75:
-        start_idx = int(num_layers * 0.50)
-        end_idx = int(num_layers * 0.75) - 1
-    elif k == 1.0:
-        start_idx = int(num_layers * 0.75)
-        end_idx = num_layers - 1
-    else:
-        raise ValueError(f"Unknown k value: {k}")
-    start_idx = max(0, min(start_idx, num_layers - 1))
-    end_idx = max(start_idx, min(end_idx, num_layers - 1))
-    return start_idx, end_idx
-
-
-def pair_full_epoch(forget_loader, retain_loader):
-    len_f, len_r = len(forget_loader), len(retain_loader)
-    if len_f >= len_r:
-        main_iter = zip(forget_loader, cycle(retain_loader))
-        num_steps = len_f
-    else:
-        main_iter = zip(cycle(forget_loader), retain_loader)
-        num_steps = len_r
-    return main_iter, num_steps
-
-
-def linear_alpha(epoch: int, epochs: int, alpha: float, alpha_start: float, alpha_end: float) -> float:
-    if alpha_start >= 0 and alpha_end >= 0:
-        if epochs <= 1:
-            return alpha_end
-        t = epoch / (epochs - 1)
-        return alpha_start + t * (alpha_end - alpha_start)
-    return alpha
 
 
 def all_reduce_mean(x: torch.Tensor) -> torch.Tensor:
-    if not dist.is_initialized():
+    if not (dist.is_available() and dist.is_initialized()):
         return x
     y = x.clone()
     dist.all_reduce(y, op=dist.ReduceOp.SUM)
@@ -167,621 +88,598 @@ def all_reduce_mean(x: torch.Tensor) -> torch.Tensor:
 
 
 # -------------------------
-# Dataset / Collator
+# Data
 # -------------------------
-class PromptGenDataset(Dataset):
-    def __init__(self, data_list: List[dict]):
-        self.data = data_list
 
-    def __len__(self) -> int:
-        return len(self.data)
+class ListDictDataset(Dataset):
+    def __init__(self, rows: List[Dict[str, Any]]):
+        self.rows = rows
 
-    def __getitem__(self, idx: int) -> dict:
-        ex = self.data[idx]
-        return {
-            "prompt": ex["prompt"],
-            "generation": ex["generation"],
-            "label": int(ex["label"]),
-        }
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, idx):
+        return self.rows[idx]
+
+
+def load_listdict(path: str) -> List[Dict[str, Any]]:
+    # supports .pkl (pickle list), .json (list), .jsonl
+    if path.endswith(".pkl") or path.endswith(".pickle"):
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        if not isinstance(obj, list):
+            raise ValueError("Pickle must contain a list of dictionaries.")
+        return obj
+
+    if path.endswith(".json"):
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if not isinstance(obj, list):
+            raise ValueError(".json must contain a list of dictionaries.")
+        return obj
+
+    if path.endswith(".jsonl"):
+        rows = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+        return rows
+
+    raise ValueError("Unsupported data format. Use .pkl/.pickle, .json, or .jsonl")
 
 
 @dataclass
-class CausalCollator:
-    tokenizer: any
-    seq_len: int
+class Batch:
+    input_ids: torch.Tensor          # [B, T]
+    attention_mask: torch.Tensor     # [B, T]
+    gen_mask: torch.Tensor           # [B, T] bool; True where generation tokens are
+    # for token-accuracy (optional)
+    labels_next: torch.Tensor        # [B, T] int64; next-token labels (shifted), -100 masked
 
-    def __call__(self, batch: List[dict]) -> Dict[str, torch.Tensor]:
-        prompts = [b["prompt"] for b in batch]
-        gens = [b["generation"] for b in batch]
-        labels01 = torch.tensor([int(b["label"]) for b in batch], dtype=torch.long)
 
-        # tokenize prompt alone to get prompt length
-        prompt_tok = self.tokenizer(
-            prompts,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=self.seq_len,
-            return_attention_mask=False,
+class CollatorGenMask:
+    def __init__(self, tokenizer, seq_len: int):
+        self.tok = tokenizer
+        self.seq_len = seq_len
+
+    def __call__(self, examples: List[Dict[str, Any]]) -> Batch:
+        prompts = [ex["prompt"] for ex in examples]
+        gens = [ex["generation"] for ex in examples]
+
+        # tokenize prompt and generation separately so we can build a generation-only mask
+        p = self.tok(prompts, add_special_tokens=False)
+        g = self.tok(gens, add_special_tokens=False)
+
+        input_ids = []
+        attention_mask = []
+        gen_mask = []
+        labels_next = []
+
+        eos = self.tok.eos_token_id
+
+        for p_ids, g_ids in zip(p["input_ids"], g["input_ids"]):
+            # sequence: prompt + generation + eos
+            ids = (p_ids + g_ids + [eos])[: self.seq_len]
+            attn = [1] * len(ids)
+
+            # generation mask: True on generation tokens (+ eos) only
+            # prompt part length may be truncated
+            prompt_len = min(len(p_ids), self.seq_len)
+            gen_start = prompt_len
+            gm = [False] * len(ids)
+            for t in range(gen_start, len(ids)):
+                gm[t] = True
+
+            # pad
+            pad_id = self.tok.pad_token_id
+            if pad_id is None:
+                # GPT2 has no pad by default; set to eos in tokenizer setup
+                pad_id = eos
+
+            pad_n = self.seq_len - len(ids)
+            if pad_n > 0:
+                ids = ids + [pad_id] * pad_n
+                attn = attn + [0] * pad_n
+                gm = gm + [False] * pad_n
+
+            ids_t = torch.tensor(ids, dtype=torch.long)
+            attn_t = torch.tensor(attn, dtype=torch.long)
+            gm_t = torch.tensor(gm, dtype=torch.bool)
+
+            # next-token labels for *generation tokens* only (token accuracy logging)
+            # labels_next[t] = input_ids[t+1], with last position ignored
+            lbl = torch.full((self.seq_len,), -100, dtype=torch.long)
+            # positions where we want to evaluate next-token prediction:
+            # predict token at t+1 based on token at t, so mask at t where gm[t+1] is True.
+            for t in range(self.seq_len - 1):
+                if gm_t[t + 1] and attn_t[t + 1] == 1:
+                    lbl[t] = ids_t[t + 1]
+            # last token has no next token
+            lbl[self.seq_len - 1] = -100
+
+            input_ids.append(ids_t)
+            attention_mask.append(attn_t)
+            gen_mask.append(gm_t)
+            labels_next.append(lbl)
+
+        return Batch(
+            input_ids=torch.stack(input_ids, dim=0),
+            attention_mask=torch.stack(attention_mask, dim=0),
+            gen_mask=torch.stack(gen_mask, dim=0),
+            labels_next=torch.stack(labels_next, dim=0),
         )
-        prompt_lens = [len(x) for x in prompt_tok["input_ids"]]
-
-        # tokenize full text = prompt + generation
-        full_text = [p + g for p, g in zip(prompts, gens)]
-        full = self.tokenizer(
-            full_text,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=self.seq_len,
-            padding="max_length",
-            return_tensors="pt",
-        )
-
-        input_ids = full["input_ids"]
-        attn = full["attention_mask"]
-
-        # labels for causal LM: same shape as input_ids; mask prompt tokens
-        lm_labels = input_ids.clone()
-        for i, pl in enumerate(prompt_lens):
-            pl = min(pl, self.seq_len)
-            lm_labels[i, :pl] = -100
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attn,
-            "labels": lm_labels,
-            "label01": labels01,  # not used by model; just for debugging
-        }
 
 
 # -------------------------
-# RMU layer selection for GPT-2
+# RMU core
 # -------------------------
-def get_gpt2_rmu_layers(model: torch.nn.Module) -> List[str]:
-    """
-    Return a list of layer module names whose activations we can hook.
-    We pick projection outputs inside each block (stable hidden size):
-      - transformer.h.{i}.attn.c_proj
-      - transformer.h.{i}.mlp.c_proj
 
-    Order matters (earlier -> later).
-    """
-    names: List[str] = []
-    # Works for GPT2LMHeadModel: model.transformer.h is a ModuleList
-    n_blocks = len(model.transformer.h)
-    for i in range(n_blocks):
-        attn_name = f"transformer.h.{i}.attn.c_proj"
-        mlp_name = f"transformer.h.{i}.mlp.c_proj"
-        # Only include if present (robustness)
-        try:
-            _ = model.get_submodule(attn_name)
-            names.append(attn_name)
-        except Exception:
-            pass
-        try:
-            _ = model.get_submodule(mlp_name)
-            names.append(mlp_name)
-        except Exception:
-            pass
-    if len(names) == 0:
-        raise RuntimeError("No RMU-hookable GPT-2 layers found. Check module names.")
-    return names
-
-
-def create_random_u_vectors(layer_names: List[str], hidden_size: int, device: torch.device) -> Dict[str, torch.Tensor]:
-    """
-    For GPT-2, hooked activations are typically (B, T, C) where C=hidden_size.
-    So each u is a (1, 1, C) unit vector.
-    """
-    u = {}
-    for ln in layer_names:
-        v = torch.rand(hidden_size, device=device)
-        v = v / (torch.norm(v) + 1e-12)
-        u[ln] = v.view(1, 1, -1)
+def sample_u(hidden_size: int, device: torch.device, normalize: bool = True) -> torch.Tensor:
+    # pseudocode: independent entries uniform[0,1)
+    u = torch.rand(hidden_size, device=device)
+    if normalize:
+        u = u / (u.norm(p=2) + 1e-12)
     return u
 
 
-def compute_layer_rms_gpt2(
-    model_frozen: torch.nn.Module,
-    layer_name: str,
-    retain_loader,
-    device: torch.device,
-    num_batches: int = 2,
-) -> float:
-    activations: Dict[str, torch.Tensor] = {}
-
-    def hook_fn(_m, _inp, out):
-        # out can be (B,T,C)
-        activations["act"] = out
-
-    handle = model_frozen.get_submodule(layer_name).register_forward_hook(hook_fn)
-    model_frozen.eval()
-    cnt = 0
-    with torch.no_grad():
-        for batch in retain_loader:
-            batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-            _ = model_frozen(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
-            if "act" in activations:
-                act = activations["act"].detach()
-                rms = torch.sqrt(torch.mean(act.float() ** 2)).item()
-                handle.remove()
-                return float(rms)
-            cnt += 1
-            if cnt >= num_batches:
-                break
-    handle.remove()
-    return 1.0
-
-
-# -------------------------
-# Checkpoint IO
-# -------------------------
-def _is_hf_dir(path: str) -> bool:
-    return os.path.isdir(path) and os.path.exists(os.path.join(path, "config.json"))
-
-
-def load_model_with_optional_step_checkpoint(
-    model_name_or_path: str,
-    resume_dir: Optional[str],
-    torch_dtype: torch.dtype,
-) -> Tuple[torch.nn.Module, any, dict]:
+def extract_layer_hidden(hidden_states: Tuple[torch.Tensor, ...], rmu_layer: int) -> torch.Tensor:
     """
-    Loads GPT-2 base model, then (optionally) loads a step checkpoint that only has
-    pytorch_model.bin (+ optimizer/scheduler/meta).
-    Returns (model, tokenizer, meta_dict).
+    GPT2 returns hidden_states with length = n_layer + 1:
+      hidden_states[0] is embeddings output
+      hidden_states[i] is output after transformer block i-1
+    So "layer k" block output is hidden_states[k+1].
+    We'll accept rmu_layer in [0, n_layer-1] (transformer block index).
     """
-    tok = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-
-    cfg = AutoConfig.from_pretrained(model_name_or_path)
-    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, config=cfg, torch_dtype=torch_dtype)
-
-    meta = {}
-    if resume_dir:
-        meta_path = os.path.join(resume_dir, "meta.json")
-        meta = load_json_if_exists(meta_path) or {}
-
-        model_bin = os.path.join(resume_dir, "pytorch_model.bin")
-        if os.path.exists(model_bin):
-            sd = torch.load(model_bin, map_location="cpu")
-            missing, unexpected = model.load_state_dict(sd, strict=False)
-            if is_rank0():
-                print(f"[resume] loaded {model_bin}")
-                if missing:
-                    print(f"[resume] missing keys (showing up to 10): {missing[:10]}")
-                if unexpected:
-                    print(f"[resume] unexpected keys (showing up to 10): {unexpected[:10]}")
-        else:
-            if is_rank0():
-                print(f"[resume] WARNING: {model_bin} not found; using base weights.")
-
-    return model, tok, meta
+    idx = rmu_layer + 1
+    if idx < 0 or idx >= len(hidden_states):
+        raise ValueError(f"rmu_layer={rmu_layer} out of range for hidden_states len={len(hidden_states)}")
+    return hidden_states[idx]  # [B, T, H]
 
 
-def save_step_checkpoint(
-    model_fsdp: FSDP,
-    tokenizer,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    out_step_dir: str,
-    meta: dict,
-    save_optimizer: bool = True,
-    save_scheduler: bool = True,
-):
-    safe_makedirs(out_step_dir)
+def masked_mse(x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    x, y: [B,T,H]
+    mask: [B,T] bool (True positions used)
+    """
+    # avoid empty mask
+    denom = mask.sum().clamp_min(1).to(x.dtype)
+    diff2 = (x - y).pow(2).sum(dim=-1)  # [B,T]
+    return (diff2 * mask.to(diff2.dtype)).sum() / denom
 
-    # Gather full state dict on rank0
-    full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(model_fsdp, StateDictType.FULL_STATE_DICT, full_cfg):
-        full_sd = model_fsdp.state_dict()
 
-    if is_rank0():
-        torch.save(full_sd, os.path.join(out_step_dir, "pytorch_model.bin"))
-        if save_optimizer:
-            torch.save(optimizer.state_dict(), os.path.join(out_step_dir, "optimizer.pt"))
-        if save_scheduler and scheduler is not None:
-            torch.save(scheduler.state_dict(), os.path.join(out_step_dir, "scheduler.pt"))
-        with open(os.path.join(out_step_dir, "meta.json"), "w") as f:
-            json.dump(meta, f, indent=2, sort_keys=True)
-
-        # also save tokenizer files for convenience
-        try:
-            tokenizer.save_pretrained(out_step_dir)
-        except Exception:
-            pass
+@torch.no_grad()
+def token_accuracy_from_logits(logits: torch.Tensor, labels_next: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    logits: [B,T,V]
+    labels_next: [B,T] with -100 masked
+    returns: (correct_count, total_count) as tensors on same device
+    """
+    pred = torch.argmax(logits, dim=-1)  # [B,T]
+    mask = labels_next != -100
+    total = mask.sum()
+    correct = ((pred == labels_next) & mask).sum()
+    return correct, total
 
 
 # -------------------------
-# Main RMU training
+# Main
 # -------------------------
-def build_argparser():
+
+def parse_args():
     p = argparse.ArgumentParser()
 
-    # IO
-    p.add_argument("--data_path", type=str, required=True, help="Pickle path: list of dicts with prompt/generation/label.")
-    p.add_argument("--model_name_or_path", type=str, default="gpt2")
-    p.add_argument("--resume_dir", type=str, default=None, help="Step dir containing pytorch_model.bin/optimizer.pt/scheduler.pt/meta.json")
+    p.add_argument("--data_path", type=str, required=True,
+                   help="Path to .pkl/.json/.jsonl containing list of dicts with prompt,generation,label")
+    p.add_argument("--ckpt_dir", type=str, required=True,
+                   help="Directory containing your finetuned checkpoint files (pytorch_model.bin, optimizer.pt, scheduler.pt, meta.json)")
     p.add_argument("--output_dir", type=str, required=True)
 
-    # Data / loader
+    p.add_argument("--base_model", type=str, default="gpt2")
     p.add_argument("--seq_len", type=int, default=256)
     p.add_argument("--batch_size", type=int, default=2)
-    p.add_argument("--num_workers", type=int, default=2)
-
-    # Train
-    p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--grad_accum", type=int, default=8)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--epochs", type=int, default=1)
+
+    p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--warmup_ratio", type=float, default=0.03)
-    p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--max_steps", type=int, default=-1, help="Override total steps; -1 means infer from data")
 
-    # RMU
-    p.add_argument("--k_schedule", type=str, default="0.75,1.0,1.0,1.0")
-    p.add_argument("--alpha", type=float, default=1000.0)
-    p.add_argument("--alpha_start", type=float, default=-1.0)
-    p.add_argument("--alpha_end", type=float, default=-1.0)
-    p.add_argument("--c", type=float, default=4.0)
-    p.add_argument("--auto_scale_c", action="store_true")
-    p.add_argument("--c_scale", type=float, default=3.0)
-
-    # Optional GA on forget
-    p.add_argument("--ga_forget_weight", type=float, default=0.0, help="If >0, add (-w * LM_loss_forget) to total loss (gradient ascent).")
-
-    # FSDP / precision
-    p.add_argument("--bf16", action="store_true", help="Use bf16 mixed precision (recommended on A5000).")
-    p.add_argument("--seed", type=int, default=42)
+    # RMU hyperparams
+    p.add_argument("--alpha", type=float, default=4.0, help="retain loss weight")
+    p.add_argument("--c", type=float, default=1.0, help="target magnitude for forget activations: c*u")
+    p.add_argument("--rmu_layer", type=int, default=8, help="GPT2 transformer block index [0..n_layer-1]")
+    p.add_argument("--u_resample", type=str, default="step", choices=["step", "epoch", "never"],
+                   help="When to resample u (random direction vector)")
 
     # Logging / saving
     p.add_argument("--log_every", type=int, default=20)
-    p.add_argument("--save_every_steps", type=int, default=500)
-    p.add_argument("--save_optimizer", action="store_true")
-    p.add_argument("--save_scheduler", action="store_true")
+    p.add_argument("--eval_every", type=int, default=200)
+    p.add_argument("--save_every", type=int, default=500)
 
-    # wandb
-    p.add_argument("--wandb_project", type=str, default=None)
-    p.add_argument("--run_name", type=str, default=None)
+    p.add_argument("--wandb_project", type=str, default="")
+    p.add_argument("--wandb_run_name", type=str, default="")
+    p.add_argument("--wandb_entity", type=str, default="")
+    p.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
 
-    return p
+    p.add_argument("--seed", type=int, default=42)
+
+    # resume optimizer/scheduler from ckpt_dir
+    p.add_argument("--resume_optimizer", action="store_true")
+    p.add_argument("--resume_scheduler", action="store_true")
+
+    # numerical / perf
+    p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--fp16", action="store_true", help="Use fp16 mixed precision (recommended on A5000)")
+
+    return p.parse_args()
+
+
+def build_models(args, device: torch.device):
+    """
+    Load base model first, then apply finetuned weights from ckpt_dir/pytorch_model.bin.
+    Also build a frozen reference model (not FSDP) for retain activation matching.
+    """
+    # tokenizer
+    tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token  # important for padding GPT2
+
+    # base model
+    base = AutoModelForCausalLM.from_pretrained(args.base_model)
+    base.config.use_cache = False
+    base.config.output_hidden_states = True
+
+    # apply finetuned weights
+    wpath = os.path.join(args.ckpt_dir, "pytorch_model.bin")
+    if not os.path.exists(wpath):
+        raise FileNotFoundError(f"Missing {wpath}")
+
+    state = torch.load(wpath, map_location="cpu")
+    missing, unexpected = base.load_state_dict(state, strict=False)
+    if is_rank0():
+        print(f"[load_state_dict] missing={len(missing)} unexpected={len(unexpected)}")
+        if len(unexpected) > 0:
+            print("  unexpected example:", unexpected[:10])
+
+    # frozen ref model (same weights at start)
+    frozen = AutoModelForCausalLM.from_pretrained(args.base_model)
+    frozen.config.use_cache = False
+    frozen.config.output_hidden_states = True
+    frozen.load_state_dict(base.state_dict(), strict=True)
+    frozen.to(device)
+    frozen.eval()
+    for p in frozen.parameters():
+        p.requires_grad_(False)
+
+    return tok, base, frozen
+
+
+def wrap_fsdp(model: torch.nn.Module, fp16: bool) -> FSDP:
+    from functools import partial
+    from transformers.models.gpt2.modeling_gpt2 import GPT2Block
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    from torch.distributed.fsdp.fully_sharded_data_parallel import MixedPrecision
+    from torch.distributed.fsdp import ShardingStrategy
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    mp = None
+    if fp16:
+        mp = MixedPrecision(
+            param_dtype=torch.float16,
+            reduce_dtype=torch.float16,
+            buffer_dtype=torch.float16,
+        )
+
+    # ✅ correct for your signature: transformer_auto_wrap_policy(module, recurse, nonwrapped_numel, transformer_layer_cls=...)
+    auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={GPT2Block})
+
+    fsdp_model = FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        mixed_precision=mp,
+        device_id=torch.cuda.current_device(),
+        limit_all_gathers=True,
+    )
+    return fsdp_model
+
+
+
+@torch.no_grad()
+def evaluate(model: FSDP, frozen: torch.nn.Module, loader: DataLoader, args, device) -> Dict[str, float]:
+    model.eval()
+    total_loss_f = torch.tensor(0.0, device=device)
+    total_loss_r = torch.tensor(0.0, device=device)
+    total_corr = torch.tensor(0, device=device, dtype=torch.long)
+    total_cnt = torch.tensor(0, device=device, dtype=torch.long)
+
+    # fixed u for eval for stability
+    u = sample_u(model.module.config.n_embd, device=device, normalize=True)
+    target = args.c * u  # [H]
+
+    for batch in loader:
+        input_ids = batch.input_ids.to(device, non_blocking=True)
+        attention_mask = batch.attention_mask.to(device, non_blocking=True)
+        gen_mask = batch.gen_mask.to(device, non_blocking=True)
+        labels_next = batch.labels_next.to(device, non_blocking=True)
+
+        out_u = model(input_ids=input_ids, attention_mask=attention_mask)
+        hs_u = extract_layer_hidden(out_u.hidden_states, args.rmu_layer)  # [B,T,H]
+
+        out_f = frozen(input_ids=input_ids, attention_mask=attention_mask)
+        hs_f = extract_layer_hidden(out_f.hidden_states, args.rmu_layer)
+
+        # forget-style loss (toward c*u) and retain-style loss (match frozen)
+        tgt = target.view(1, 1, -1).expand_as(hs_u)
+        lf = masked_mse(hs_u, tgt, gen_mask)
+        lr = masked_mse(hs_u, hs_f, gen_mask)
+
+        total_loss_f += lf
+        total_loss_r += lr
+
+        corr, cnt = token_accuracy_from_logits(out_u.logits, labels_next)
+        total_corr += corr
+        total_cnt += cnt
+
+    # reduce across ranks
+    total_loss_f = all_reduce_mean(total_loss_f)
+    total_loss_r = all_reduce_mean(total_loss_r)
+    total_corr = all_reduce_mean(total_corr.float()).long()  # ok since same size loaders recommended
+    total_cnt = all_reduce_mean(total_cnt.float()).long()
+
+    acc = (total_corr.float() / total_cnt.clamp_min(1).float()).item()
+    return {
+        "eval_forget_loss": total_loss_f.item() / max(len(loader), 1),
+        "eval_retain_loss": total_loss_r.item() / max(len(loader), 1),
+        "eval_token_acc": acc,
+    }
 
 
 def main():
-    args = build_argparser().parse_args()
+    args = parse_args()
+    setup_distributed()
+    seed_all(args.seed + (dist.get_rank() if dist.is_initialized() else 0))
 
-    # local rank (torchrun)
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    ddp_setup(local_rank)
+    device = torch.device("cuda", torch.cuda.current_device())
 
-    set_all_seeds(args.seed + local_rank)
-
-    device = torch.device("cuda", local_rank)
-    torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
-
-    # --- wandb (rank0 only) ---
-    wandb = None
-    if args.wandb_project and is_rank0():
-        import wandb as _wandb  # local import
-        wandb = _wandb
-        wandb.init(project=args.wandb_project, name=args.run_name, config=vars(args))
-
-    # --- load data ---
-    import pickle
-    with open(args.data_path, "rb") as f:
-        data_list = pickle.load(f)
-    ds = PromptGenDataset(data_list)
-
-    # split indices
-    forget_idx = [i for i, ex in enumerate(data_list) if int(ex["label"]) == 1]
-    retain_idx = [i for i, ex in enumerate(data_list) if int(ex["label"]) == 0]
+    os.makedirs(args.output_dir, exist_ok=True)
     if is_rank0():
-        print(f"[data] total={len(ds)} forget={len(forget_idx)} retain={len(retain_idx)}")
+        with open(os.path.join(args.output_dir, "args.json"), "w") as f:
+            json.dump(vars(args), f, indent=2)
 
-    forget_ds = Subset(ds, forget_idx)
-    retain_ds = Subset(ds, retain_idx)
+    # wandb
+    use_wandb = (args.wandb_mode != "disabled") and (wandb is not None) and is_rank0() and (args.wandb_project != "")
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name if args.wandb_run_name else None,
+            entity=args.wandb_entity if args.wandb_entity else None,
+            mode=args.wandb_mode,
+            config=vars(args),
+        )
 
-    # --- model/tokenizer/load checkpoint ---
-    model, tokenizer, meta = load_model_with_optional_step_checkpoint(
-        args.model_name_or_path,
-        args.resume_dir,
-        torch_dtype=torch_dtype,
-    )
-    model.to(device)
+    # build models
+    tok, model, frozen = build_models(args, device)
 
-    # frozen teacher (per-rank full copy; simplest & robust)
-    model_frozen = copy.deepcopy(model).to(device)
-    model_frozen.eval()
-    for p in model_frozen.parameters():
-        p.requires_grad_(False)
+    # FSDP wrap
+    model = wrap_fsdp(model, fp16=args.fp16)
+    model.train()
 
-    # Candidate RMU layers & u-vectors
-    layer_names = get_gpt2_rmu_layers(model)
-    hidden_size = model.config.n_embd
-    u_vectors = create_random_u_vectors(layer_names, hidden_size=hidden_size, device=device)
+    # load data
+    rows = load_listdict(args.data_path)
+    forget_rows = [r for r in rows if int(r["label"]) == 1]
+    retain_rows = [r for r in rows if int(r["label"]) == 0]
+    if is_rank0():
+        print(f"Loaded rows={len(rows)} forget={len(forget_rows)} retain={len(retain_rows)}")
 
-    # Collator + loaders
-    collate = CausalCollator(tokenizer=tokenizer, seq_len=args.seq_len)
+    forget_ds = ListDictDataset(forget_rows)
+    retain_ds = ListDictDataset(retain_rows)
 
-    forget_sampler = DistributedSampler(forget_ds, shuffle=True, drop_last=True)
-    retain_sampler = DistributedSampler(retain_ds, shuffle=True, drop_last=True)
+    collate = CollatorGenMask(tok, seq_len=args.seq_len)
 
-    forget_loader = DataLoader(
-        forget_ds,
-        batch_size=args.batch_size,
-        sampler=forget_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collate,
-    )
-    retain_loader = DataLoader(
-        retain_ds,
-        batch_size=args.batch_size,
-        sampler=retain_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collate,
-    )
+    # NOTE: simplest: each rank sees different shards via DistributedSampler (recommended),
+    # but if you want strict determinism you can add it. Here we keep it simple:
+    forget_loader = DataLoader(forget_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, drop_last=True)
+    retain_loader = DataLoader(retain_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, drop_last=True)
 
-    # --- wrap with FSDP ---
-    # GPT-2 block type for auto-wrap
-    from transformers.models.gpt2.modeling_gpt2 import GPT2Block
+    # optimizer / scheduler
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    mp_policy = MixedPrecision(
-        param_dtype=torch.bfloat16 if args.bf16 else torch.float32,
-        reduce_dtype=torch.bfloat16 if args.bf16 else torch.float32,
-        buffer_dtype=torch.bfloat16 if args.bf16 else torch.float32,
-    )
-    auto_wrap = transformer_auto_wrap_policy({GPT2Block})
+    # total steps
+    steps_per_epoch = min(len(forget_loader), len(retain_loader))
+    if steps_per_epoch == 0:
+        raise ValueError("Forget/retain loaders are empty. Check labels and data.")
 
-    model_fsdp = FSDP(
-        model,
-        auto_wrap_policy=auto_wrap,
-        mixed_precision=mp_policy,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        device_id=device,
-        use_orig_params=True,
-    )
+    total_steps = steps_per_epoch * args.epochs
+    if args.max_steps > 0:
+        total_steps = args.max_steps
 
-    # optimizer/scheduler
-    optimizer = torch.optim.AdamW(model_fsdp.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    sched = get_linear_schedule_with_warmup(optim, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
 
-    # resume optimizer/scheduler if present
-    global_step = int(meta.get("global_step", 0)) if isinstance(meta, dict) else 0
-    if args.resume_dir:
-        opt_sd = torch_load_if_exists(os.path.join(args.resume_dir, "optimizer.pt"), map_location="cpu")
-        if opt_sd is not None:
-            try:
-                optimizer.load_state_dict(opt_sd)
-                if is_rank0():
-                    print("[resume] optimizer loaded")
-            except Exception as e:
-                if is_rank0():
-                    print(f"[resume] optimizer load failed (continuing): {e}")
-
-    # total steps ~ epochs * max(len_f, len_r) / grad_accum
-    steps_per_epoch = max(len(forget_loader), len(retain_loader))
-    total_optim_steps = math.ceil(args.epochs * steps_per_epoch / max(1, args.grad_accum))
-    warmup_steps = int(args.warmup_ratio * total_optim_steps)
-
-    scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_optim_steps)
-
-    if args.resume_dir:
-        sch_sd = torch_load_if_exists(os.path.join(args.resume_dir, "scheduler.pt"), map_location="cpu")
-        if sch_sd is not None:
-            try:
-                scheduler.load_state_dict(sch_sd)
-                if is_rank0():
-                    print("[resume] scheduler loaded")
-            except Exception as e:
-                if is_rank0():
-                    print(f"[resume] scheduler load failed (continuing): {e}")
-
-    # Activation buffers (per step)
-    acts: Dict[str, torch.Tensor] = {}
-
-    def hook_factory(key: str):
-        def _hook(_m, _inp, out):
-            acts[key] = out
-        return _hook
-
-    k_schedule = parse_k_schedule(args.k_schedule, args.epochs)
-
-    model_fsdp.train()
-
-    # main training
-    for epoch in range(args.epochs):
-        forget_sampler.set_epoch(epoch)
-        retain_sampler.set_epoch(epoch)
-
-        k = k_schedule[epoch]
-        start_i, end_i = get_layer_range_indices(k, len(layer_names))
-        sampled_i = random.randint(start_i, end_i)
-        sampled_layer = layer_names[sampled_i]
-
-        alpha_e = linear_alpha(epoch, args.epochs, args.alpha, args.alpha_start, args.alpha_end)
-
-        if args.auto_scale_c:
-            rms = compute_layer_rms_gpt2(model_frozen, sampled_layer, retain_loader, device=device, num_batches=2)
-            c_e = args.c_scale * max(rms, 1e-6)
+    # optional resume
+    if args.resume_optimizer:
+        opath = os.path.join(args.ckpt_dir, "optimizer.pt")
+        if os.path.exists(opath):
+            ck = torch.load(opath, map_location="cpu")
+            optim.load_state_dict(ck)
+            if is_rank0():
+                print(f"Resumed optimizer from {opath}")
         else:
-            c_e = args.c
+            if is_rank0():
+                print(f"[warn] resume_optimizer set but missing {opath}")
 
-        # register hooks on the sampled layer
-        h_updated = model_fsdp.get_submodule(sampled_layer).register_forward_hook(hook_factory("updated"))
-        h_frozen = model_frozen.get_submodule(sampled_layer).register_forward_hook(hook_factory("frozen"))
+    if args.resume_scheduler:
+        spath = os.path.join(args.ckpt_dir, "scheduler.pt")
+        if os.path.exists(spath):
+            ck = torch.load(spath, map_location="cpu")
+            sched.load_state_dict(ck)
+            if is_rank0():
+                print(f"Resumed scheduler from {spath}")
+        else:
+            if is_rank0():
+                print(f"[warn] resume_scheduler set but missing {spath}")
 
-        main_iter, num_steps = pair_full_epoch(forget_loader, retain_loader)
+    # training
+    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
 
-        if is_rank0():
-            print(
-                f"[epoch {epoch+1}/{args.epochs}] layer={sampled_layer} "
-                f"range=[{start_i},{end_i}] steps={num_steps} alpha={alpha_e:.2f} c={c_e:.4f} k={k}"
-            )
+    hidden_size = model.module.config.n_embd
+    u = sample_u(hidden_size, device=device, normalize=True)  # initial u
+    global_step = 0
 
-        pbar = tqdm(total=num_steps, disable=not is_rank0(), leave=False)
+    pbar = tqdm(total=total_steps, disable=not is_rank0(), dynamic_ncols=True, desc="RMU train")
 
-        running = {
-            "loss_total": 0.0,
-            "loss_forget_rmu": 0.0,
-            "loss_retain_match": 0.0,
-            "loss_forget_lm": 0.0,
-        }
-        denom = 0
+    retain_iter = iter(retain_loader)
+    forget_iter = iter(forget_loader)
 
-        for step_i, (fb, rb) in enumerate(main_iter, start=1):
-            # move batches
-            fb = {k: v.to(device, non_blocking=True) for k, v in fb.items() if isinstance(v, torch.Tensor)}
-            rb = {k: v.to(device, non_blocking=True) for k, v in rb.items() if isinstance(v, torch.Tensor)}
+    def next_batch(it, loader):
+        try:
+            return next(it), it
+        except StopIteration:
+            it = iter(loader)
+            return next(it), it
 
-            # grad accumulation: use no_sync for micro-steps
-            accum_idx = (step_i - 1) % args.grad_accum
-            do_step = (accum_idx == args.grad_accum - 1) or (step_i == num_steps)
+    while global_step < total_steps:
+        # u resampling
+        if args.u_resample == "step":
+            u = sample_u(hidden_size, device=device, normalize=True)
+        elif args.u_resample == "epoch":
+            # resample when at epoch boundary (approx)
+            if global_step % steps_per_epoch == 0:
+                u = sample_u(hidden_size, device=device, normalize=True)
+        # else: never
 
-            ctx = model_fsdp.no_sync() if (args.grad_accum > 1 and not do_step) else torch.enable_grad()
-            with ctx:
-                # clear activation dict each micro-step
-                acts.clear()
+        # fetch forget/retain batches
+        b_forget, forget_iter = next_batch(forget_iter, forget_loader)
+        b_retain, retain_iter = next_batch(retain_iter, retain_loader)
 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if args.bf16 else torch.float32):
-                    # FORGET pass (updated model)
-                    out_f = model_fsdp(
-                        input_ids=fb["input_ids"],
-                        attention_mask=fb["attention_mask"],
-                        labels=fb["labels"],
-                    )
-                    act_f = acts.get("updated", None)
-                    if act_f is None:
-                        continue
+        # move to device
+        f_input_ids = b_forget.input_ids.to(device, non_blocking=True)
+        f_attn = b_forget.attention_mask.to(device, non_blocking=True)
+        f_gmask = b_forget.gen_mask.to(device, non_blocking=True)
 
-                    # RMU forget loss: push activations toward c*u
-                    u = u_vectors[sampled_layer]  # (1,1,C)
-                    # act_f is typically (B,T,C). Broadcast u over (B,T,*)
-                    loss_forget_rmu = torch.mean((act_f - (c_e * u)) ** 2)
+        r_input_ids = b_retain.input_ids.to(device, non_blocking=True)
+        r_attn = b_retain.attention_mask.to(device, non_blocking=True)
+        r_gmask = b_retain.gen_mask.to(device, non_blocking=True)
+        r_labels_next = b_retain.labels_next.to(device, non_blocking=True)
 
-                    # Optional: GA on forget LM loss (gradient ascent => subtract)
-                    loss_forget_lm = out_f.loss
-                    ga_term = -args.ga_forget_weight * loss_forget_lm if args.ga_forget_weight > 0 else 0.0
+        # grad accum
+        optim.zero_grad(set_to_none=True)
 
-                    # RETAIN pass (frozen + updated)
-                    _ = model_frozen(input_ids=rb["input_ids"], attention_mask=rb["attention_mask"])
-                    act_r_frozen = acts.get("frozen", None)
-                    _ = model_fsdp(input_ids=rb["input_ids"], attention_mask=rb["attention_mask"])
-                    act_r_updated = acts.get("updated", None)
-                    if act_r_frozen is None or act_r_updated is None:
-                        continue
+        accum_forget = 0.0
+        accum_retain = 0.0
+        accum_acc = 0.0
+        accum_cnt = 0.0
 
-                    loss_retain = torch.mean((act_r_updated - act_r_frozen) ** 2)
+        for micro in range(args.grad_accum):
+            # reuse same batches across micros (simple); if you prefer, you can draw new batches each micro
+            with torch.cuda.amp.autocast(enabled=args.fp16):
+                # updated model forward on forget
+                out_f_u = model(input_ids=f_input_ids, attention_mask=f_attn)
+                hs_f_u = extract_layer_hidden(out_f_u.hidden_states, args.rmu_layer)  # [B,T,H]
+                tgt = (args.c * u).view(1, 1, -1).expand_as(hs_f_u)
+                loss_forget = masked_mse(hs_f_u, tgt, f_gmask)
 
-                    loss = loss_forget_rmu + alpha_e * loss_retain + ga_term
-                    loss = loss / max(1, args.grad_accum)
+                # updated model forward on retain
+                out_r_u = model(input_ids=r_input_ids, attention_mask=r_attn)
+                hs_r_u = extract_layer_hidden(out_r_u.hidden_states, args.rmu_layer)
 
-                loss.backward()
+                # frozen forward on retain
+                with torch.no_grad():
+                    out_r_f = frozen(input_ids=r_input_ids, attention_mask=r_attn)
+                    hs_r_f = extract_layer_hidden(out_r_f.hidden_states, args.rmu_layer)
 
-            if do_step:
-                if args.grad_clip and args.grad_clip > 0:
-                    model_fsdp.clip_grad_norm_(args.grad_clip)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
+                loss_retain = masked_mse(hs_r_u, hs_r_f, r_gmask)
 
-            # logging (reduce to mean across ranks)
+                loss = (loss_forget + args.alpha * loss_retain) / args.grad_accum
+
+            scaler.scale(loss).backward()
+
+            accum_forget += float(loss_forget.detach())
+            accum_retain += float(loss_retain.detach())
+
+            # token accuracy on retain generation tokens (next-token)
             with torch.no_grad():
-                lt = torch.tensor(float(loss_forget_rmu.detach().float().item()), device=device)
-                lr = torch.tensor(float(loss_retain.detach().float().item()), device=device)
-                lf = torch.tensor(float(loss_forget_lm.detach().float().item()), device=device)
-                ltot = torch.tensor(float((loss.detach().float().item()) * max(1, args.grad_accum)), device=device)
+                corr, cnt = token_accuracy_from_logits(out_r_u.logits, r_labels_next)
+                accum_acc += float(corr)
+                accum_cnt += float(cnt)
 
-                lt = all_reduce_mean(lt).item()
-                lr = all_reduce_mean(lr).item()
-                lf = all_reduce_mean(lf).item()
-                ltot = all_reduce_mean(ltot).item()
+        # unscale + clip + step
+        scaler.unscale_(optim)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-                running["loss_total"] += ltot
-                running["loss_forget_rmu"] += lt
-                running["loss_retain_match"] += lr
-                running["loss_forget_lm"] += lf
-                denom += 1
+        scaler.step(optim)
+        scaler.update()
+        sched.step()
 
-                if is_rank0():
-                    pbar.update(1)
+        global_step += 1
+        pbar.update(1)
 
-                if wandb is not None and is_rank0() and (global_step % args.log_every == 0) and do_step:
-                    wandb.log(
-                        {
-                            "train/loss_total": ltot,
-                            "train/loss_forget_rmu": lt,
-                            "train/loss_retain_match": lr,
-                            "train/loss_forget_lm": lf,
-                            "train/alpha": alpha_e,
-                            "train/c": c_e,
-                            "train/k": k,
-                            "train/lr": scheduler.get_last_lr()[0],
-                            "train/epoch": epoch + 1,
-                            "train/global_step": global_step,
-                            "train/sampled_layer": sampled_i,
-                        },
-                        step=global_step,
-                    )
+        # logging
+        if is_rank0() and (global_step % args.log_every == 0 or global_step == 1):
+            lr = sched.get_last_lr()[0]
+            tok_acc = (accum_acc / max(accum_cnt, 1.0))
 
-            # save
-            if do_step and (global_step % args.save_every_steps == 0):
-                meta_out = {
+            log = {
+                "step": global_step,
+                "lr": lr,
+                "forget_loss": accum_forget / args.grad_accum,
+                "retain_loss": accum_retain / args.grad_accum,
+                "total_loss": (accum_forget / args.grad_accum) + args.alpha * (accum_retain / args.grad_accum),
+                "grad_norm": float(grad_norm.detach().cpu()),
+                "retain_token_acc": tok_acc,
+            }
+            pbar.set_postfix({k: (f"{v:.4g}" if isinstance(v, float) else v) for k, v in log.items() if k != "step"})
+            if use_wandb:
+                wandb.log(log, step=global_step)
+
+        # lightweight eval (retain set) + save
+        if global_step % args.eval_every == 0:
+            # small eval loader sample to keep it cheap
+            # (you can replace with a proper DistributedSampler + full pass)
+            eval_loader = DataLoader(retain_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate, drop_last=False)
+            metrics = evaluate(model, frozen, eval_loader, args, device)
+            if is_rank0():
+                print("\nEVAL:", metrics)
+                if use_wandb:
+                    wandb.log(metrics, step=global_step)
+
+            model.train()
+
+        if global_step % args.save_every == 0 or global_step == total_steps:
+            if is_rank0():
+                save_dir = os.path.join(args.output_dir, f"step_{global_step:08d}")
+                os.makedirs(save_dir, exist_ok=True)
+
+                # save model weights (gathered by rank0)
+                # WARNING: this saves *full* state dict on rank0. OK for GPT2.
+                full_state = model.state_dict()
+                torch.save(full_state, os.path.join(save_dir, "pytorch_model.bin"))
+
+                # save optimizer / scheduler
+                torch.save(optim.state_dict(), os.path.join(save_dir, "optimizer.pt"))
+                torch.save(sched.state_dict(), os.path.join(save_dir, "scheduler.pt"))
+
+                meta = {
                     "global_step": global_step,
-                    "epoch": epoch + 1,
-                    "sampled_layer": sampled_layer,
-                    "alpha": alpha_e,
-                    "c": c_e,
-                    "k": k,
-                    "time": time.time(),
+                    "base_model": args.base_model,
+                    "ckpt_dir_applied": args.ckpt_dir,
+                    "rmu_layer": args.rmu_layer,
+                    "alpha": args.alpha,
+                    "c": args.c,
                 }
-                step_dir = os.path.join(args.output_dir, f"step_{global_step:08d}")
-                save_step_checkpoint(
-                    model_fsdp,
-                    tokenizer,
-                    optimizer,
-                    scheduler,
-                    step_dir,
-                    meta_out,
-                    save_optimizer=args.save_optimizer,
-                    save_scheduler=args.save_scheduler,
-                )
-                if is_rank0():
-                    print(f"[save] {step_dir}")
+                with open(os.path.join(save_dir, "meta.json"), "w") as f:
+                    json.dump(meta, f, indent=2)
 
-        if is_rank0():
-            pbar.close()
-            if denom > 0:
-                print(
-                    f"[epoch {epoch+1}] "
-                    f"avg_total={running['loss_total']/denom:.4f} "
-                    f"avg_forget_rmu={running['loss_forget_rmu']/denom:.4f} "
-                    f"avg_retain={running['loss_retain_match']/denom:.6f} "
-                    f"avg_forget_lm={running['loss_forget_lm']/denom:.4f}"
-                )
+                print(f"\nSaved checkpoint to {save_dir}")
 
-        # remove hooks
-        h_updated.remove()
-        h_frozen.remove()
-
-    # final save
-    final_meta = {"global_step": global_step, "time": time.time(), "done": True}
-    final_dir = os.path.join(args.output_dir, f"final_step_{global_step:08d}")
-    save_step_checkpoint(
-        model_fsdp,
-        tokenizer,
-        optimizer,
-        scheduler,
-        final_dir,
-        final_meta,
-        save_optimizer=args.save_optimizer,
-        save_scheduler=args.save_scheduler,
-    )
-    if is_rank0():
-        print(f"[final] saved to {final_dir}")
-        if wandb is not None:
-            wandb.finish()
-
-    ddp_cleanup()
+    pbar.close()
+    if use_wandb:
+        wandb.finish()
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

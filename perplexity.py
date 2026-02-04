@@ -28,6 +28,7 @@ from typing import List, Optional, Tuple
 
 import torch
 from datasets import load_dataset
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -52,6 +53,11 @@ def parse_args():
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp16", "bf16", "fp32"])
     p.add_argument("--json", action="store_true", help="Print a single JSON line (nice for bash loops)")
+
+    # tqdm controls
+    p.add_argument("--tqdm", action="store_true", help="Enable tqdm progress bars")
+    p.add_argument("--tqdm_update", type=int, default=50, help="Update tqdm postfix every N steps (avoid overhead)")
+
     return p.parse_args()
 
 
@@ -102,31 +108,57 @@ def collect_toxic_texts(
     tox_threshold: float,
     max_toxic_samples: int,
     max_total_scanned: int,
+    use_tqdm: bool = True,
+    tqdm_update: int = 50,
 ) -> Tuple[List[str], int, float]:
     toxic_texts: List[str] = []
     scanned = 0
     tox_sum = 0.0
 
-    for ex in itertools.islice(iter(ds), max_total_scanned):
+    # IMPORTANT: cap progress total to max_total_scanned (not full dataset length)
+    # so tqdm never displays huge totals like 319,895 when you only want to scan up to N.
+    scan_cap = max_total_scanned
+
+    iterator = itertools.islice(iter(ds), max_total_scanned)
+
+    pbar = None
+    if use_tqdm:
+        # If streaming, total can still be shown as scan_cap since we are hard-capping the scan.
+        pbar = tqdm(total=scan_cap, desc="Scanning for toxic samples", unit="ex")
+
+    for ex in iterator:
         scanned += 1
+
         tox = ex.get(tox_field, None)
         txt = ex.get(text_field, None)
 
-        if not isinstance(txt, str) or not txt.strip():
-            continue
-        if tox is None:
-            continue
+        if isinstance(txt, str) and txt.strip() and tox is not None:
+            try:
+                tox_val = float(tox)
+            except Exception:
+                tox_val = None
 
-        try:
-            tox_val = float(tox)
-        except Exception:
-            continue
+            if tox_val is not None and tox_val >= tox_threshold:
+                toxic_texts.append(txt)
+                tox_sum += tox_val
 
-        if tox_val >= tox_threshold:
-            toxic_texts.append(txt)
-            tox_sum += tox_val
-            if len(toxic_texts) >= max_toxic_samples:
-                break
+        if pbar:
+            pbar.update(1)
+            if scanned % max(1, tqdm_update) == 0:
+                pbar.set_postfix(
+                    scanned=scanned,
+                    toxic=len(toxic_texts),
+                    avg_tox=(tox_sum / len(toxic_texts)) if toxic_texts else 0.0,
+                )
+
+        if len(toxic_texts) >= max_toxic_samples:
+            break
+
+    if pbar:
+        # If we stopped early (hit max_toxic_samples), move bar to completion for a clean UI.
+        if scanned < scan_cap:
+            pbar.update(scan_cap - scanned)
+        pbar.close()
 
     avg_tox = (tox_sum / len(toxic_texts)) if toxic_texts else 0.0
     return toxic_texts, scanned, avg_tox
@@ -149,6 +181,8 @@ def main():
         tox_threshold=args.tox_threshold,
         max_toxic_samples=args.max_toxic_samples,
         max_total_scanned=args.max_total_scanned,
+        use_tqdm=args.tqdm,
+        tqdm_update=args.tqdm_update,
     )
 
     if not toxic_texts:
@@ -159,15 +193,26 @@ def main():
 
     eos_id = tokenizer.eos_token_id
     all_ids: List[int] = []
-    for t in toxic_texts:
+
+    tok_pbar = tqdm(total=len(toxic_texts), desc="Tokenizing toxic texts", unit="txt") if args.tqdm else None
+    for i, t in enumerate(toxic_texts, start=1):
         ids = tokenizer(t, add_special_tokens=False).input_ids
         if ids:
             all_ids.extend(ids)
             if eos_id is not None:
                 all_ids.append(eos_id)
+
+        if tok_pbar:
+            tok_pbar.update(1)
+            if i % max(1, args.tqdm_update) == 0:
+                tok_pbar.set_postfix(tokens=len(all_ids))
+
         if args.max_tokens and len(all_ids) >= args.max_tokens:
             all_ids = all_ids[: args.max_tokens]
             break
+
+    if tok_pbar:
+        tok_pbar.close()
 
     enc = torch.tensor(all_ids, dtype=torch.long)
     if enc.numel() < 2:
@@ -181,11 +226,13 @@ def main():
     n_tokens = 0
     prev_end_loc = 0
 
-    for begin_loc in range(0, enc.size(0), stride):
+    total_windows = (enc.size(0) + stride - 1) // stride
+    win_pbar = tqdm(total=total_windows, desc="Scoring windows", unit="win") if args.tqdm else None
+
+    for w_i, begin_loc in enumerate(range(0, enc.size(0), stride), start=1):
         end_loc = min(begin_loc + seq_len, enc.size(0))
         input_ids = enc[begin_loc:end_loc].unsqueeze(0).to(args.device)
 
-        # score only "new" tokens to avoid double-counting overlap
         trg_len = end_loc - prev_end_loc
         labels = input_ids.clone()
         if trg_len < labels.size(1):
@@ -197,8 +244,16 @@ def main():
         n_tokens += trg_len
         prev_end_loc = end_loc
 
+        if win_pbar:
+            win_pbar.update(1)
+            if w_i % max(1, args.tqdm_update) == 0:
+                win_pbar.set_postfix(tokens_scored=n_tokens, avg_nll=(nll_sum / max(1, n_tokens)))
+
         if end_loc == enc.size(0):
             break
+
+    if win_pbar:
+        win_pbar.close()
 
     avg_nll = nll_sum / max(1, n_tokens)
     ppl = math.exp(avg_nll)

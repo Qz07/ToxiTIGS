@@ -38,4 +38,6 @@ python perplexity.py \
   --split test \
   --tox_threshold 0.5 \
   --max_toxic_samples 5000 \
-  --seq_len 256 --stride 1
+  --seq_len 256 --stride 1 \
+  --tqdm
+
