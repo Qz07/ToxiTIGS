@@ -3,7 +3,7 @@ export TOKENIZERS_PARALLELISM=false
 
 DATA_PATH="./data/jan26_filter_lt_256_248k.pickle"
 CKPT_DIR="./ckpts/train_lt_256/step_00000484"   # contains config.json + model.safetensors etc
-OUT_DIR="./ckpts/rmu_out_gpt2"
+OUT_DIR="./ckpts/rnpo_out_gpt2"
 WANDB_PROJ="ToxicGS-unlearning"
 RUN_NAME="npo-gpt2-fsdp"
 
@@ -14,8 +14,8 @@ torchrun --nproc_per_node=2 unlearn_npo.py \
   --base_model gpt2 \
   --output_dir "$OUT_DIR" \
   --max_length 256 \
-  --batch_size 32 \
-  --grad_accum 8 \
+  --batch_size 16 \
+  --grad_accum 16 \
   --epochs 1 \
   --lr 2e-5 \
   --beta 0.1 \

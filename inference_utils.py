@@ -27,11 +27,12 @@ def _load_generator(
     Loads a causal LM generator from:
       - a HF model name (e.g., "gpt2")
       - a HF checkpoint dir (has config.json)
-      - a raw state_dict file or dir (e.g., pytorch_model.bin) *if* base_model_name_if_state_dict is provided
+      - a raw state_dict file or dir (e.g., pytorch_model_final.bin / pytorch_model_step*.bin)
+        *if* base_model_name_if_state_dict is provided
     """
     torch_dtype = torch_dtype or (torch.float16 if torch.cuda.is_available() else torch.float32)
 
-    # Try standard HF load first
+    # (A) Try standard HF load first (name or HF dir)
     try:
         tok = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
         gen = AutoModelForCausalLM.from_pretrained(
@@ -46,45 +47,78 @@ def _load_generator(
     except Exception:
         pass
 
-    # If not loadable directly, try state_dict route
+    # (B/C) State-dict route (requires base model)
     if base_model_name_if_state_dict is None:
         raise ValueError(
             f"Could not load '{model_name_or_path}' via from_pretrained. "
-            f"If this is a raw state_dict checkpoint, pass base_model_name_if_state_dict="
-            f"(e.g., 'gpt2' / 'gpt2-medium' / etc.)."
+            f"If this is a raw checkpoint/state_dict (or a checkpoint dir with pytorch_model_final.bin), "
+            f"pass --base_model (e.g., 'gpt2')."
         )
 
     base_tok = AutoTokenizer.from_pretrained(base_model_name_if_state_dict, use_fast=True)
     if base_tok.pad_token_id is None:
         base_tok.pad_token = base_tok.eos_token
 
-    base_cfg = AutoConfig.from_pretrained(base_model_name_if_state_dict)
-    gen = AutoModelForCausalLM.from_config(base_cfg)
+    # IMPORTANT: use from_pretrained(base_model) (not from_config) so weights are initialized correctly
+    gen = AutoModelForCausalLM.from_pretrained(
+        base_model_name_if_state_dict,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
+    )
 
-    # find state_dict
+    # --- find state_dict path ---
     sd_path = model_name_or_path
+
     if os.path.isdir(sd_path):
-        # common filenames
-        for cand in ["pytorch_model.bin", "model.pt", "model.bin"]:
-            p = os.path.join(sd_path, cand)
-            if os.path.exists(p):
-                sd_path = p
-                break
+        # 1) prefer your format: pytorch_model_final.bin
+        cand = os.path.join(sd_path, "pytorch_model_final.bin")
+        if os.path.isfile(cand):
+            sd_path = cand
+        else:
+            # 2) else latest pytorch_model_step*.bin
+            step_paths = glob.glob(os.path.join(sd_path, "pytorch_model_step*.bin"))
+            if step_paths:
+                def step_num(p: str) -> int:
+                    m = re.search(r"pytorch_model_step(\d+)\.bin$", os.path.basename(p))
+                    return int(m.group(1)) if m else -1
+                step_paths.sort(key=step_num)
+                sd_path = step_paths[-1]
+            else:
+                # 3) fallback: common names
+                for cand_name in ["pytorch_model.bin", "model.pt", "model.bin"]:
+                    cand = os.path.join(sd_path, cand_name)
+                    if os.path.isfile(cand):
+                        sd_path = cand
+                        break
 
+    if not (os.path.isfile(sd_path) and sd_path.endswith((".bin", ".pt"))):
+        raise FileNotFoundError(
+            f"Could not find a weights file in '{model_name_or_path}'. "
+            f"Expected pytorch_model_final.bin or pytorch_model_step*.bin (or pytorch_model.bin)."
+        )
+
+    # --- load state ---
     state = torch.load(sd_path, map_location="cpu")
+
+    # handle wrapper dicts
     if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
-        state = state["state_dict"]
+        state_dict = state["state_dict"]
+    elif isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
+        state_dict = state["model"]
+    else:
+        state_dict = state
 
-    missing, unexpected = gen.load_state_dict(state, strict=False)
+    missing, unexpected = gen.load_state_dict(state_dict, strict=False)
+    print(f"[load] raw_checkpoint={model_name_or_path}")
+    print(f"[load] using weights file: {sd_path}")
     if missing:
-        print(f"[warn] Missing keys while loading state_dict (showing first 20): {missing[:20]}")
+        print(f"[warn] Missing keys (first 20): {missing[:20]}")
     if unexpected:
-        print(f"[warn] Unexpected keys while loading state_dict (showing first 20): {unexpected[:20]}")
+        print(f"[warn] Unexpected keys (first 20): {unexpected[:20]}")
 
-    gen.to("cuda" if torch.cuda.is_available() else "cpu")
-    gen = gen.to(dtype=torch_dtype)
     gen.eval()
     return base_tok, gen
+
 
 
 def _load_toxicity_scorer(
@@ -268,6 +302,7 @@ def infer_and_score_toxicity(
             top_p=top_p if do_sample else None,
             pad_token_id=gen_tok.pad_token_id,
             eos_token_id=gen_tok.eos_token_id,
+            remove_invalid_values=True,
         )
         # remove Nones
         gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
