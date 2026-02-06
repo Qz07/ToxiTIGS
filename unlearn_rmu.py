@@ -291,7 +291,7 @@ def parse_args():
     p.add_argument("--alpha", type=float, default=4.0, help="retain loss weight")
     p.add_argument("--c", type=float, default=1.0, help="target magnitude for forget activations: c*u")
     p.add_argument("--rmu_layer", type=int, default=8, help="GPT2 transformer block index [0..n_layer-1]")
-    p.add_argument("--u_resample", type=str, default="step", choices=["step", "epoch", "never"],
+    p.add_argument("--u_resample", type=str, default="epoch", choices=["step", "epoch", "never"],
                    help="When to resample u (random direction vector)")
 
     # Logging / saving
@@ -531,152 +531,183 @@ def main():
     global_step = 0
 
     pbar = tqdm(total=total_steps, disable=not is_rank0(), dynamic_ncols=True, desc="RMU train")
-
+    
+    optim_steps = total_steps  # keep your existing meaning: total optimizer updates
+    micro_steps_total = optim_steps * args.grad_accum
+    
+    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+    
+    hidden_size = model.module.config.n_embd
+    u = sample_u(hidden_size, device=device, normalize=True)
+    
+    # iterators
     retain_iter = iter(retain_loader)
     forget_iter = iter(forget_loader)
-
+    
     def next_batch(it, loader):
         try:
             return next(it), it
         except StopIteration:
             it = iter(loader)
             return next(it), it
-
-    while global_step < total_steps:
-        # u resampling
-        if args.u_resample == "step":
-            u = sample_u(hidden_size, device=device, normalize=True)
-        elif args.u_resample == "epoch":
-            # resample when at epoch boundary (approx)
-            if global_step % steps_per_epoch == 0:
+    
+    # accumulators (for logging per optimizer step)
+    accum_forget = 0.0
+    accum_retain = 0.0
+    accum_acc = 0.0
+    accum_cnt = 0.0
+    
+    # step counters
+    global_micro = 0        # counts micro-steps
+    global_step = 0         # counts optimizer steps (what you log/save/eval on)
+    
+    # start accumulation window
+    optim.zero_grad(set_to_none=True)
+    
+    pbar = tqdm(total=optim_steps, disable=not is_rank0(), dynamic_ncols=True, desc="RMU train")
+    
+    while global_micro < micro_steps_total:
+        # Determine whether this micro-step starts a new accumulation window
+        micro_in_window = global_micro % args.grad_accum
+        start_of_window = (micro_in_window == 0)
+    
+        # Resample u ONCE per optimizer step (i.e., per window), not per micro
+        # This matches the common intent of "step" meaning "optimizer step".
+        if start_of_window:
+            if args.u_resample == "step":
                 u = sample_u(hidden_size, device=device, normalize=True)
-        # else: never
-
-        # fetch forget/retain batches
+            elif args.u_resample == "epoch":
+                # approx epoch boundary in optimizer-step space
+                if global_step % steps_per_epoch == 0:
+                    u = sample_u(hidden_size, device=device, normalize=True)
+            # else: never
+    
+            # reset logging accumulators for this optimizer step
+            accum_forget = 0.0
+            accum_retain = 0.0
+            accum_acc = 0.0
+            accum_cnt = 0.0
+    
+        # fetch NEW microbatches each micro-step (this is the key fix)
         b_forget, forget_iter = next_batch(forget_iter, forget_loader)
         b_retain, retain_iter = next_batch(retain_iter, retain_loader)
-
+    
         # move to device
         f_input_ids = b_forget.input_ids.to(device, non_blocking=True)
-        f_attn = b_forget.attention_mask.to(device, non_blocking=True)
-        f_gmask = b_forget.gen_mask.to(device, non_blocking=True)
-
+        f_attn      = b_forget.attention_mask.to(device, non_blocking=True)
+        f_gmask     = b_forget.gen_mask.to(device, non_blocking=True)
+    
         r_input_ids = b_retain.input_ids.to(device, non_blocking=True)
-        r_attn = b_retain.attention_mask.to(device, non_blocking=True)
-        r_gmask = b_retain.gen_mask.to(device, non_blocking=True)
-        r_labels_next = b_retain.labels_next.to(device, non_blocking=True)
-
-        # grad accum
-        optim.zero_grad(set_to_none=True)
-
-        accum_forget = 0.0
-        accum_retain = 0.0
-        accum_acc = 0.0
-        accum_cnt = 0.0
-
-        for micro in range(args.grad_accum):
-            # reuse same batches across micros (simple); if you prefer, you can draw new batches each micro
-            with torch.cuda.amp.autocast(enabled=args.fp16):
-                # updated model forward on forget
-                out_f_u = model(input_ids=f_input_ids, attention_mask=f_attn)
-                hs_f_u = extract_layer_hidden(out_f_u.hidden_states, args.rmu_layer)  # [B,T,H]
-                tgt = (args.c * u).view(1, 1, -1).expand_as(hs_f_u)
-                loss_forget = masked_mse(hs_f_u, tgt, f_gmask)
-
-                # updated model forward on retain
-                out_r_u = model(input_ids=r_input_ids, attention_mask=r_attn)
-                hs_r_u = extract_layer_hidden(out_r_u.hidden_states, args.rmu_layer)
-
-                # frozen forward on retain
-                with torch.no_grad():
-                    out_r_f = frozen(input_ids=r_input_ids, attention_mask=r_attn)
-                    hs_r_f = extract_layer_hidden(out_r_f.hidden_states, args.rmu_layer)
-
-                loss_retain = masked_mse(hs_r_u, hs_r_f, r_gmask)
-
-                loss = (loss_forget + args.alpha * loss_retain) / args.grad_accum
-
-            scaler.scale(loss).backward()
-
-            accum_forget += float(loss_forget.detach())
-            accum_retain += float(loss_retain.detach())
-
-            # token accuracy on retain generation tokens (next-token)
+        r_attn      = b_retain.attention_mask.to(device, non_blocking=True)
+        r_gmask     = b_retain.gen_mask.to(device, non_blocking=True)
+        r_labels    = b_retain.labels_next.to(device, non_blocking=True)
+    
+        with torch.cuda.amp.autocast(enabled=args.fp16):
+            # updated model forward on forget
+            out_f_u = model(input_ids=f_input_ids, attention_mask=f_attn)
+            hs_f_u  = extract_layer_hidden(out_f_u.hidden_states, args.rmu_layer)  # [B,T,H]
+            tgt     = (args.c * u).view(1, 1, -1).expand_as(hs_f_u)
+            loss_forget = masked_mse(hs_f_u, tgt, f_gmask)
+    
+            # updated model forward on retain
+            out_r_u = model(input_ids=r_input_ids, attention_mask=r_attn)
+            hs_r_u  = extract_layer_hidden(out_r_u.hidden_states, args.rmu_layer)
+    
+            # frozen forward on retain
             with torch.no_grad():
-                corr, cnt = token_accuracy_from_logits(out_r_u.logits, r_labels_next)
-                accum_acc += float(corr)
-                accum_cnt += float(cnt)
-
-        # unscale + clip + step
-        scaler.unscale_(optim)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
-        scaler.step(optim)
-        scaler.update()
-        sched.step()
-
-        global_step += 1
-        pbar.update(1)
-
-        # logging
-        if is_rank0() and (global_step % args.log_every == 0 or global_step == 1):
-            lr = sched.get_last_lr()[0]
-            tok_acc = (accum_acc / max(accum_cnt, 1.0))
-
-            log = {
-                "step": global_step,
-                "lr": lr,
-                "forget_loss": accum_forget / args.grad_accum,
-                "retain_loss": accum_retain / args.grad_accum,
-                "total_loss": (accum_forget / args.grad_accum) + args.alpha * (accum_retain / args.grad_accum),
-                "grad_norm": float(grad_norm.detach().cpu()),
-                "retain_token_acc": tok_acc,
-            }
-            pbar.set_postfix({k: (f"{v:.4g}" if isinstance(v, float) else v) for k, v in log.items() if k != "step"})
-            if use_wandb:
-                wandb.log(log, step=global_step)
-
-        # lightweight eval (retain set) + save
-        if global_step % args.eval_every == 0:
-            # small eval loader sample to keep it cheap
-            # (you can replace with a proper DistributedSampler + full pass)
-            eval_loader = DataLoader(retain_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate, drop_last=False)
-            metrics = evaluate(model, frozen, eval_loader, args, device)
-            if is_rank0():
-                print("\nEVAL:", metrics)
-                if use_wandb:
-                    wandb.log(metrics, step=global_step)
-
-            model.train()
-
-        if global_step % args.save_every == 0 or global_step == total_steps:
-            if is_rank0():
-                save_dir = os.path.join(args.output_dir, f"step_{global_step:08d}")
-                os.makedirs(save_dir, exist_ok=True)
-
-                # save model weights (gathered by rank0)
-                # WARNING: this saves *full* state dict on rank0. OK for GPT2.
-                full_state = model.state_dict()
-                torch.save(full_state, os.path.join(save_dir, "pytorch_model.bin"))
-
-                # save optimizer / scheduler
-                torch.save(optim.state_dict(), os.path.join(save_dir, "optimizer.pt"))
-                torch.save(sched.state_dict(), os.path.join(save_dir, "scheduler.pt"))
-
-                meta = {
-                    "global_step": global_step,
-                    "base_model": args.base_model,
-                    "ckpt_dir_applied": args.ckpt_dir,
-                    "rmu_layer": args.rmu_layer,
-                    "alpha": args.alpha,
-                    "c": args.c,
+                out_r_f = frozen(input_ids=r_input_ids, attention_mask=r_attn)
+                hs_r_f  = extract_layer_hidden(out_r_f.hidden_states, args.rmu_layer)
+    
+            loss_retain = masked_mse(hs_r_u, hs_r_f, r_gmask)
+    
+            # scale by grad_accum so summed grads match "big batch"
+            loss = (loss_forget + args.alpha * loss_retain) / args.grad_accum
+    
+        scaler.scale(loss).backward()
+    
+        # logging accumulators (unscaled, per microbatch)
+        accum_forget += float(loss_forget.detach())
+        accum_retain += float(loss_retain.detach())
+        with torch.no_grad():
+            corr, cnt = token_accuracy_from_logits(out_r_u.logits, r_labels)
+            accum_acc += float(corr)
+            accum_cnt += float(cnt)
+    
+        global_micro += 1
+    
+        # if end of accumulation window -> optimizer update
+        end_of_window = (global_micro % args.grad_accum == 0)
+        if end_of_window:
+            # unscale + clip + step
+            scaler.unscale_(optim)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+    
+            scaler.step(optim)
+            scaler.update()
+            sched.step()
+            optim.zero_grad(set_to_none=True)
+    
+            global_step += 1
+            pbar.update(1)
+    
+            # logging (now global_step is an optimizer step)
+            if is_rank0() and (global_step % args.log_every == 0 or global_step == 1):
+                lr = sched.get_last_lr()[0]
+                tok_acc = accum_acc / max(accum_cnt, 1.0)
+    
+                log = {
+                    "step": global_step,
+                    "lr": lr,
+                    # average over the grad_accum microbatches used in this optimizer step
+                    "forget_loss": accum_forget / args.grad_accum,
+                    "retain_loss": accum_retain / args.grad_accum,
+                    "total_loss": (accum_forget / args.grad_accum) + args.alpha * (accum_retain / args.grad_accum),
+                    "grad_norm": float(grad_norm.detach().cpu()),
+                    "retain_token_acc": tok_acc,
                 }
-                with open(os.path.join(save_dir, "meta.json"), "w") as f:
-                    json.dump(meta, f, indent=2)
-
-                print(f"\nSaved checkpoint to {save_dir}")
-
+                pbar.set_postfix({k: (f"{v:.4g}" if isinstance(v, float) else v)
+                                  for k, v in log.items() if k != "step"})
+                if use_wandb:
+                    wandb.log(log, step=global_step)
+    
+            # eval/save keyed to optimizer steps (unchanged behavior)
+            if global_step % args.eval_every == 0:
+                eval_loader = DataLoader(
+                    retain_ds, batch_size=args.batch_size, shuffle=False,
+                    collate_fn=collate, drop_last=False
+                )
+                metrics = evaluate(model, frozen, eval_loader, args, device)
+                if is_rank0():
+                    print("\nEVAL:", metrics)
+                    if use_wandb:
+                        wandb.log(metrics, step=global_step)
+                model.train()
+    
+            if global_step % args.save_every == 0 or global_step == optim_steps:
+                if is_rank0():
+                    save_dir = os.path.join(args.output_dir, f"step_{global_step:08d}")
+                    os.makedirs(save_dir, exist_ok=True)
+    
+                    full_state = model.state_dict()
+                    torch.save(full_state, os.path.join(save_dir, "pytorch_model.bin"))
+                    torch.save(optim.state_dict(), os.path.join(save_dir, "optimizer.pt"))
+                    torch.save(sched.state_dict(), os.path.join(save_dir, "scheduler.pt"))
+    
+                    meta = {
+                        "global_step": global_step,
+                        "base_model": args.base_model,
+                        "ckpt_dir_applied": args.ckpt_dir,
+                        "rmu_layer": args.rmu_layer,
+                        "alpha": args.alpha,
+                        "c": args.c,
+                    }
+                    with open(os.path.join(save_dir, "meta.json"), "w") as f:
+                        json.dump(meta, f, indent=2)
+    
+                    print(f"\nSaved checkpoint to {save_dir}")
+    
     pbar.close()
+
     if use_wandb:
         wandb.finish()
     cleanup_distributed()
