@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 1. Configuration - Update these paths
-MODEL_PATH="./ckpts/npo_out_gpt2"
+MODEL_PATH="./ckpts/idknpo_out_gpt2_feb8"
 # MODEL_PATH="gpt2"               # or path/to/your/checkpoint
 # or path/to/your/checkpoint
 DATA_PATH="./data/jan22_test_310.pickle"

@@ -485,7 +485,7 @@ def main():
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=max(total_steps, 1)
     )
 
-    maybe_resume_opt_sched(args.ckpt_dir, optimizer, scheduler, args.resume_optimizer)
+    # maybe_resume_opt_sched(args.ckpt_dir, optimizer, scheduler, args.resume_optimizer)
 
     # wandb
     if is_main():
