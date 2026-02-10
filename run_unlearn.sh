@@ -3,9 +3,9 @@ export TOKENIZERS_PARALLELISM=false
 
 DATA_PATH="./data/jan26_filter_lt_256_248k.pickle"
 CKPT_DIR="./ckpts/train_lt_256/step_00000484"   # contains config.json + model.safetensors etc
-OUT_DIR="./ckpts/idknpo_out_gpt2_feb8_3epoch"
+OUT_DIR="./ckpts/idknpo_out_gpt2_feb8_2epoch"
 WANDB_PROJ="ToxicGS-unlearning"
-RUN_NAME="idkdpo-gpt2-fsdp-feb_3epoch"
+RUN_NAME="idkdpo-gpt2-fsdp-feb_2epoch"
 FT_FILE="pytorch_model.bin"
 
 
@@ -19,7 +19,7 @@ torchrun --standalone --nproc_per_node=2 unlearn_idknpo.py \
   --batch_size_retain 16 \
   --batch_size_forget 16 \
   --grad_accum 8 \
-  --epochs 3 \
+  --epochs 2 \
   --lr 2e-5 \
   --warmup_steps 50 \
   --beta 0.1 \
